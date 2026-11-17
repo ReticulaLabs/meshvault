@@ -128,7 +128,7 @@ meshvault id                   Destination and identity hashes
 meshvault add <path> [--name]  Import a file or directory tree
 meshvault get <hash> [-o PATH] Fetch a file or directory tree
 meshvault ls [hash]            List local objects, or a remote directory
-meshvault remove <hash>        Remove one object from the local repository
+meshvault remove <hash> [--recursive]  Remove an object or an unreferenced tree
 meshvault peers                Known/connected peers
 meshvault announce             Announce immediately
 ```
@@ -182,7 +182,7 @@ Methods:
 | `add` | `{path, name?}` | `{object, path}` |
 | `get` / `fetch` | `{hash, output?}` | `{object, path, bytes, resumed, sources}` |
 | `ls` / `list` | `{}` or `{hash}` | local object array, or `{root, name, entries}` |
-| `remove` | `{hash}` | boolean |
+| `remove` | `{hash, recursive?}` | boolean |
 | `peers` | `{}` | peer array |
 | `announce` | `{}` | boolean |
 
@@ -247,7 +247,7 @@ This build configures Reticulum **TCP client/server** interfaces. Point `connect
 
 All writes are staged in `tmp/`, `fsync`ed, and atomically renamed. A crash leaves either the old object or the new object, never a partial blob advertised as complete. Fetched files are verified piece-by-piece and then re-hashed in full against the root before being promoted.
 
-`remove <hash>` removes that object only. Removing a directory removes its listing; child objects remain because they may be shared. There is currently no garbage collector or pinning policy.
+`remove <hash>` removes one object only; removing a directory that way removes only its listing. `remove <hash> --recursive` removes the directory tree and its unreferenced children, while preserving any child still referenced by another directory manifest. There is currently no general garbage collector or pinning policy.
 
 ## Security model
 

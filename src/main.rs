@@ -91,7 +91,12 @@ enum Command {
     Ls { hash: Option<String> },
 
     /// Remove an object from the local repository.
-    Remove { hash: String },
+    Remove {
+        hash: String,
+        /// Also remove children not referenced by another directory.
+        #[arg(short, long)]
+        recursive: bool,
+    },
 
     /// List known peers.
     Peers,
@@ -230,12 +235,21 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Remove { hash } => {
+        Command::Remove { hash, recursive } => {
             let root = ContentHash::from_hex(&hash)?;
             let mut client = control::client_for(&paths).await?;
-            let removed = client.call("remove", json!({"hash": root})).await?;
+            let removed = client
+                .call("remove", json!({"hash": root, "recursive": recursive}))
+                .await?;
             if removed.as_bool().unwrap_or(false) {
-                println!("removed {root}");
+                println!(
+                    "removed {root}{}",
+                    if recursive {
+                        " and unreferenced children"
+                    } else {
+                        ""
+                    }
+                );
             } else {
                 println!("not found locally: {root}");
             }

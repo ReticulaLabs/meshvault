@@ -334,6 +334,8 @@ Why not a database?
 
 If a repository grows to millions of objects, an optional SQLite index could be added as a *cache*; the filesystem remains the source of truth.
 
+`remove --recursive` computes the target subtree, computes objects reachable from all directory manifests outside that subtree, and deletes only target objects not in the external live set. Shared children therefore remain advertised and usable through their other parents.
+
 Startup behavior:
 
 - Corrupt manifests are ignored with a warning.

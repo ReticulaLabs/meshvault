@@ -800,34 +800,74 @@ impl Store {
         Ok(known_file || known_dir)
     }
 
-    /// Remove a fetched tree, used only when caching is disabled.
+    /// Recursively remove a directory/file tree.
+    ///
+    /// Children that are still referenced by another directory manifest are
+    /// preserved.  The target tree's manifests are removed first, so objects
+    /// stop being advertised even if the process dies partway through.
     pub fn remove_tree(&self, root: ContentHash) -> Result<usize> {
+        let target = self.collect_reachable(root);
+        let live = self.collect_live_objects(&target);
+
+        let mut objects: Vec<_> = target.into_iter().collect();
+        objects.sort_by(|a, b| {
+            let a_dir = self.has_dir(*a);
+            let b_dir = self.has_dir(*b);
+            b_dir.cmp(&a_dir)
+        });
         let mut removed = 0usize;
-        let mut visited = HashSet::new();
-        self.remove_tree_inner(root, &mut visited, &mut removed)?;
+        for object in objects {
+            if !live.contains(&object) && self.remove(object)? {
+                removed += 1;
+            }
+        }
         Ok(removed)
     }
 
-    fn remove_tree_inner(
-        &self,
-        root: ContentHash,
-        visited: &mut HashSet<ContentHash>,
-        removed: &mut usize,
-    ) -> Result<()> {
-        if !visited.insert(root) {
-            return Ok(());
-        }
-        if self.has_dir(root)
-            && let Ok(manifest) = self.read_dir_manifest(root)
-        {
-            for entry in manifest.entries {
-                self.remove_tree_inner(entry.hash, visited, removed)?;
+    fn collect_reachable(&self, root: ContentHash) -> HashSet<ContentHash> {
+        let mut reachable = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(hash) = stack.pop() {
+            if !reachable.insert(hash) {
+                continue;
+            }
+            if self.has_dir(hash)
+                && let Ok(manifest) = self.read_dir_manifest(hash)
+            {
+                for entry in manifest.entries {
+                    if reachable.insert(entry.hash) && entry.kind == ObjectKind::Directory {
+                        stack.push(entry.hash);
+                    }
+                }
             }
         }
-        if self.remove(root)? {
-            *removed += 1;
+        reachable
+    }
+
+    /// Objects reachable from directory manifests outside the target tree.
+    fn collect_live_objects(&self, target: &HashSet<ContentHash>) -> HashSet<ContentHash> {
+        let mut live = HashSet::new();
+        let mut stack: Vec<ContentHash> = self
+            .dirs
+            .read()
+            .unwrap()
+            .keys()
+            .filter(|root| !target.contains(root))
+            .copied()
+            .collect();
+        while let Some(hash) = stack.pop() {
+            if !live.insert(hash) {
+                continue;
+            }
+            if let Ok(manifest) = self.read_dir_manifest(hash) {
+                for entry in manifest.entries {
+                    if live.insert(entry.hash) && entry.kind == ObjectKind::Directory {
+                        stack.push(entry.hash);
+                    }
+                }
+            }
         }
-        Ok(())
+        live
     }
 
     pub fn blob_path_for(&self, root: ContentHash) -> PathBuf {
@@ -989,6 +1029,36 @@ mod tests {
 
         assert!(store.export(manifest.root, Some(&link)).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"do not overwrite");
+    }
+
+    #[test]
+    fn recursive_remove_preserves_shared_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let store = Store::open(&repo).unwrap();
+
+        let tree_a = temp.path().join("tree-a");
+        let tree_b = temp.path().join("tree-b");
+        fs::create_dir_all(&tree_a).unwrap();
+        fs::create_dir_all(&tree_b).unwrap();
+        let shared = write_temp_file(&tree_a, "shared.bin", 4096);
+        fs::copy(&shared, tree_b.join("shared.bin")).unwrap();
+        write_temp_file(&tree_b, "only-b.bin", 2048);
+
+        let a = store.import_dir(&tree_a, 4096).unwrap();
+        let b = store.import_dir(&tree_b, 4096).unwrap();
+        let shared_hash = ContentHash::of(&fs::read(&shared).unwrap());
+        assert!(store.has_file(shared_hash));
+
+        let removed = store.remove_tree(a.root).unwrap();
+        assert!(removed >= 1);
+        assert!(!store.has_dir(a.root));
+        assert!(store.has_dir(b.root));
+        assert!(store.has_file(shared_hash));
+
+        store.remove_tree(b.root).unwrap();
+        assert!(!store.has_dir(b.root));
+        assert!(!store.has_file(shared_hash));
     }
 
     #[test]

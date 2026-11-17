@@ -543,11 +543,17 @@ impl Node {
         Ok(AddResult { object, path })
     }
 
-    pub async fn remove(&self, root: ContentHash) -> Result<bool> {
+    pub async fn remove(&self, root: ContentHash, recursive: bool) -> Result<bool> {
         let store = self.store.clone();
-        let removed = tokio::task::spawn_blocking(move || store.remove(root))
-            .await
-            .context("remove task panicked")??;
+        let removed = tokio::task::spawn_blocking(move || {
+            if recursive {
+                store.remove_tree(root).map(|removed| removed > 0)
+            } else {
+                store.remove(root)
+            }
+        })
+        .await
+        .context("remove task panicked")??;
         if removed {
             self.notify_inventory_changed();
         }

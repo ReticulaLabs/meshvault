@@ -215,7 +215,12 @@ async fn dispatch(
         "remove" => {
             let hash = param_string(&params, "hash")?;
             let root = ContentHash::from_hex(&hash)?;
-            let removed = node.remove(root).await?;
+            let recursive = match params.get("recursive") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => bail!("parameter \"recursive\" must be a boolean"),
+            };
+            let removed = node.remove(root, recursive).await?;
             Ok(json!(removed))
         }
         "peers" => Ok(serde_json::to_value(node.peers().await)?),
