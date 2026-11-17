@@ -195,7 +195,9 @@ Sender behavior:
 
 Receiver behavior:
 
-- ACK immediately on `BURST_END`, on completion, on duplicate frames (rate-limited), and periodically for very large messages
+- ACK completed messages unconditionally
+- for partial messages, ACK only after receiving at least enough payload to cover the estimated ACK wire cost (bitmap + link header + encryption overhead); `BURST_END`, duplicate frames, and periodic progress can trigger that ACK, but never with fewer bytes received
+- rate-limit duplicate ACKs; duplicate payload counts toward the byte credit so a lost ACK can be recovered by retransmission
 - clamp message size so the ACK bitmap fits in one link packet
 - enforce the same 4 MiB message cap on receive as on send
 - cap total in-progress receive bytes per link at 4 MiB
@@ -204,6 +206,8 @@ Receiver behavior:
 - cap the signalled link MTU at 4 KiB, since an inbound peer controls the MTU in its link request and could otherwise force oversized decrypt/reassembly buffers
 
 Pre-verification frames are further limited to 64 frames and 16 KiB, and ACKs are sent only for completed pre-verification messages, not for attacker-controlled partial bursts.
+
+The byte-credit rule is the anti-amplification invariant: partial ACK output is never larger than the data received since the previous ACK. A peer cannot send tiny frames with `BURST_END` and receive full-size bitmap ACKs in return.
 
 The ACK bitmap means retransmission is selective: only missing frames are resent. One ACK is typically a few bytes; for a 1 MiB chunk at 431-byte payloads, the sender sends ~2,500 frames and the final bitmap is only ~313 bytes.
 

@@ -31,6 +31,10 @@ use crate::wire::{
 };
 
 const ACK_INTERVAL: Duration = Duration::from_millis(100);
+/// Estimated non-payload overhead of an ACK on the wire (link header,
+/// encryption token, and margin).  Partial ACKs are only sent after the
+/// receiver has accumulated at least this many bytes plus the bitmap itself.
+const ACK_SIZE_MARGIN: usize = 96;
 const SEND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_FRAME_ATTEMPTS: u8 = 12;
 const MAX_REASSEMBLY_AGE: Duration = Duration::from_secs(120);
@@ -102,6 +106,10 @@ struct Reassembly {
     frames: Vec<Option<Vec<u8>>>,
     received: usize,
     bytes: usize,
+    /// Payload bytes received since the last ACK, including duplicate frames.
+    /// Duplicates count so a lost ACK can be recovered by retransmission, but
+    /// the peer must still send at least as many bytes as the ACK costs.
+    bytes_since_ack: usize,
     bitmap: Vec<u8>,
     last_ack: Instant,
     last_progress: Instant,
@@ -477,6 +485,7 @@ impl LinkSession {
                 frames: vec![None; frame.total as usize],
                 received: 0,
                 bytes: 0,
+                bytes_since_ack: 0,
                 bitmap: vec![0u8; ack_bitmap_len(frame.total)],
                 last_ack: Instant::now(),
                 last_progress: Instant::now(),
@@ -490,18 +499,23 @@ impl LinkSession {
                 entry.last_progress = Instant::now();
                 bitmap_set(&mut entry.bitmap, frame.seq);
             }
+            // Count duplicate payload too: it lets a lost ACK be recovered by
+            // retransmission, but never gives more ACK bytes than data bytes.
+            entry.bytes_since_ack = entry.bytes_since_ack.saturating_add(frame.payload.len());
             let complete = entry.received == entry.total as usize;
 
-            // Before verification, ACK only completed messages (normally the
-            // single-frame Hello).  This prevents a pre-handshake peer from
-            // using burst-end flags to turn tiny frames into a stream of ACKs.
-            let due = complete
-                || (verified
-                    && (frame.flags & FLAG_BURST_END != 0
-                        || (duplicate && entry.last_ack.elapsed() >= ACK_INTERVAL)
-                        || entry.received % 128 == 0));
-            if due {
+            if ack_is_due(AckContext {
+                verified,
+                complete,
+                burst_end: frame.flags & FLAG_BURST_END != 0,
+                duplicate,
+                received: entry.received,
+                bytes_since_ack: entry.bytes_since_ack,
+                since_last_ack: entry.last_ack.elapsed(),
+                total: entry.total,
+            }) {
                 entry.last_ack = Instant::now();
+                entry.bytes_since_ack = 0;
                 ack = Some((entry.total, entry.bitmap.clone()));
             }
             complete
@@ -858,6 +872,36 @@ fn mark_burst_end(frame: &mut [u8]) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AckContext {
+    verified: bool,
+    complete: bool,
+    burst_end: bool,
+    duplicate: bool,
+    received: usize,
+    bytes_since_ack: usize,
+    since_last_ack: Duration,
+    total: u16,
+}
+
+fn ack_wire_cost(total: u16) -> usize {
+    crate::wire::HEADER_LEN + ack_bitmap_len(total) + ACK_SIZE_MARGIN
+}
+
+fn ack_is_due(ctx: AckContext) -> bool {
+    if ctx.complete {
+        // A completed message has necessarily delivered its full payload;
+        // even a tiny complete message produces only a tiny ACK.
+        return true;
+    }
+    if !ctx.verified || ctx.bytes_since_ack < ack_wire_cost(ctx.total) {
+        return false;
+    }
+    ctx.burst_end
+        || (ctx.duplicate && ctx.since_last_ack >= ACK_INTERVAL)
+        || ctx.received.is_multiple_of(128)
+}
+
 fn pre_verification_message_allowed(incoming: &Incoming) -> bool {
     matches!(
         incoming,
@@ -977,6 +1021,61 @@ mod security_tests {
             },
         };
         assert!(!pre_verification_message_allowed(&response));
+    }
+
+    fn ack_ctx(total: u16, bytes_since_ack: usize, since_last_ack: Duration) -> AckContext {
+        AckContext {
+            verified: true,
+            complete: false,
+            burst_end: true,
+            duplicate: false,
+            received: 10,
+            bytes_since_ack,
+            since_last_ack,
+            total,
+        }
+    }
+
+    #[test]
+    fn partial_acks_require_byte_credit() {
+        let total = 3304u16;
+        let cost = ack_wire_cost(total);
+
+        assert!(ack_is_due(ack_ctx(total, cost, Duration::ZERO)));
+        assert!(!ack_is_due(ack_ctx(total, cost - 1, Duration::ZERO)));
+        assert!(!ack_is_due(AckContext {
+            verified: false,
+            ..ack_ctx(total, usize::MAX, Duration::ZERO)
+        }));
+        assert!(ack_is_due(AckContext {
+            complete: true,
+            ..ack_ctx(total, 0, Duration::ZERO)
+        }));
+    }
+
+    #[test]
+    fn duplicate_acks_are_rate_limited_and_byte_credited() {
+        let total = 3304u16;
+        let cost = ack_wire_cost(total);
+        let duplicate = |since: Duration, bytes: usize| AckContext {
+            burst_end: false,
+            duplicate: true,
+            bytes_since_ack: bytes,
+            since_last_ack: since,
+            ..ack_ctx(total, 0, Duration::ZERO)
+        };
+        assert!(ack_is_due(duplicate(ACK_INTERVAL, cost)));
+        assert!(!ack_is_due(duplicate(
+            ACK_INTERVAL - Duration::from_millis(1),
+            cost
+        )));
+        assert!(!ack_is_due(duplicate(ACK_INTERVAL, cost - 1)));
+    }
+
+    #[test]
+    fn ack_cost_scales_with_bitmap() {
+        assert!(ack_wire_cost(1) < ack_wire_cost(64));
+        assert!(ack_wire_cost(64) < ack_wire_cost(3304));
     }
 
     #[test]
