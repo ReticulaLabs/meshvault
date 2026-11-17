@@ -1,0 +1,231 @@
+# MeshVault
+
+MeshVault is a content-addressed file sharing service for [Reticulum](https://reticulum.network/) mesh networks. It is deliberately IPFS-like in use: hash a file or directory, share the hash, and anyone connected to the mesh can retrieve it.
+
+Files and directory trees are identified by BLAKE3 hashes. File data is transferred in verified pieces with adaptive chunk sizes, so a 20 MiB file can move quickly across a LAN while a LoRa link automatically stays at a single small piece.
+
+## Features
+
+- **Runs as a local service.** One daemon connects to one or more Reticulum nodes and exposes a local JSON-RPC socket.
+- **Automatic peering.** The daemon announces a `meshvault.node` destination, discovers other MeshVault peers, verifies their identity, and keeps a bounded set of links.
+- **BLAKE3 content addressing.** File hashes cover the complete file; per-piece hashes allow incremental verification and resumption.
+- **Content-addressed directories.** A directory hash covers a canonical, sorted listing of names → child file/directory hashes. Listings can be fetched without downloading the contents.
+- **Recursive retrieval.** `get <directory-hash>` fetches the directory manifest and the whole tree.
+- **Bandwidth-aware transfer.** App-level selective-repeat with compact bitmap ACKs, adaptive send windows, and chunks that grow from one piece to a configured maximum based on measured throughput.
+- **Minimal inventory traffic.** Peers exchange a 32-byte inventory digest; full inventories are only fetched when the digest changes.
+- **Crash-safe storage.** Raw blobs plus atomically written manifests. No database corruption surface; the index is rebuilt at startup.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the protocol and design rationale.
+
+## Build
+
+```sh
+cargo build --release
+```
+
+Requirements: Rust 1.85+ (edition 2024), Linux for the Unix-socket RPC service.
+
+## Quick start
+
+1. Create a configuration:
+
+```sh
+meshvault init
+```
+
+2. Edit `~/.config/meshvault/config.toml` to point at a Reticulum transport node:
+
+```toml
+name = "my-node"
+
+[interfaces]
+connect = ["127.0.0.1:4242"]
+# Optional: accept inbound Reticulum connections from nearby nodes.
+# listen = ["0.0.0.0:4243"]
+```
+
+3. Start the daemon (or let any CLI command start it automatically):
+
+```sh
+meshvault daemon
+```
+
+4. Add and share something:
+
+```sh
+$ meshvault add ./photos
+directory 8a7c50c319772dad60d8ddbe8ccd1463a9519b9b4b2115d2b87cbf2bcc6044f1  2.4 GiB  photos  (1841 entries)
+
+$ meshvault add ./report.pdf
+file      3138c77b63d7acd08f065f6915603909602008bfc8cc03fe275f9a8eaaa21a3f  20.0 MiB  report.pdf
+```
+
+5. On another peer on the mesh:
+
+```sh
+$ meshvault ls 8a7c50c319772dad60d8ddbe8ccd1463a9519b9b4b2115d2b87cbf2bcc6044f1
+directory 8a7c50c3... (1841, photos)
+  file      6d1d...  4.2 MiB  summit.jpg
+  directory 88a2...  2.1 GiB  raw
+  ...
+
+$ meshvault get 8a7c50c319772dad60d8ddbe8ccd1463a9519b9b4b2115d2b87cbf2bcc6044f1 -o ./received
+saved ./received (2.4 GiB)
+```
+
+The daemon was automatically started by the CLI if it was not already running. It caches fetched content and advertises it to other peers by default.
+
+## CLI
+
+```text
+meshvault daemon [--connect HOST:PORT]... [--listen HOST:PORT]...
+                 [--announce-interval SECS] [--max-peers N]
+                 [--name NAME] [--transport-node]
+
+meshvault init                 Create default config and print paths
+meshvault status               Daemon and repository status (JSON)
+meshvault id                   Destination and identity hashes
+meshvault add <path> [--name]  Import a file or directory tree
+meshvault get <hash> [-o PATH] Fetch a file or directory tree
+meshvault ls [hash]            List local objects, or a remote directory
+meshvault remove <hash>        Remove one object from the local repository
+meshvault peers                Known/connected peers
+meshvault announce             Announce immediately
+```
+
+`get` output rules:
+
+- File: `-o` is a file path, or an existing directory (the original name is used).
+- Directory: `-o` that already exists is treated as a parent directory (the tree is copied inside it); otherwise it is the target directory itself.
+
+Hashes accept the 64-character BLAKE3 hex form.
+
+## Running as a service
+
+`meshvault daemon` handles `SIGTERM` and `Ctrl-C`. A minimal systemd unit:
+
+```ini
+[Unit]
+Description=MeshVault Reticulum file sharing service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshvault
+ExecStart=/usr/local/bin/meshvault daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Use `meshvault init` once as that user (or set `data_dir`/`control_socket` explicitly in `/etc/meshvault/config.toml`).
+
+## Local RPC
+
+The daemon listens on `<data_dir>/control.sock` with mode `0600`. The protocol is newline-delimited JSON. Requests are handled in order per connection.
+
+```json
+{"id":1,"method":"add","params":{"path":"/srv/data/report.pdf"}}
+{"id":1,"result":{"object":{"kind":"file","root":"3138...","size":20971520,...},"path":"/srv/data/report.pdf"}}
+```
+
+Methods:
+
+| Method | Params | Result |
+|---|---|---|
+| `ping` | `{}` | `"pong"` |
+| `status` | `{}` | node/repository status object |
+| `id` | `{}` | `{destination, identity, name}` |
+| `add` | `{path, name?}` | `{object, path}` |
+| `get` / `fetch` | `{hash, output?}` | `{object, path, bytes}` |
+| `ls` / `list` | `{}` or `{hash}` | local object array, or `{root, name, entries}` |
+| `remove` | `{hash}` | boolean |
+| `peers` | `{}` | peer array |
+| `announce` | `{}` | boolean |
+
+Any local process with access to the socket can modify the repository, so the socket permissions matter. There is no network RPC listener.
+
+## Configuration
+
+```toml
+name = "my-node"                 # optional friendly name announced to peers
+# data_dir = "/var/lib/meshvault"
+# control_socket = "/run/user/1000/meshvault.sock"
+
+announce_interval_secs = 900     # minimum 60
+max_peers = 8                    # outbound links
+max_links = 64                   # total links
+piece_size = 16384               # hashing/verification piece size
+max_chunk_bytes = 1048576        # cap for one adaptive transfer message
+fetch_wait_secs = 20             # how long get waits for a peer/inventory
+cache_fetched = true             # keep and advertise fetched content
+transport_node = false           # forward traffic for other Reticulum nodes
+link_mtu_discovery = false       # keep interoperable 500-byte Reticulum MTU
+
+[interfaces]
+connect = ["127.0.0.1:4242"]
+listen = []
+# assumed_bitrate_bps = 1000000
+```
+
+Relative paths in the configuration are resolved against the configuration file's directory. Default paths follow the XDG directories (`~/.config/meshvault`, `~/.local/share/meshvault`).
+
+### Interface notes
+
+This build configures Reticulum **TCP client/server** interfaces. Point `connect` at a Reticulum transport/router that carries LoRa, packet radio, serial, or other interfaces; MeshVault then participates in that wider mesh without needing direct radio hardware.
+
+`link_mtu_discovery` is off by default. Reticulum's interoperable packet MTU is 500 bytes; some SDK/interface combinations do not reliably carry larger link packets. Leave it off unless every peer is known to support a larger link MTU.
+
+## Storage
+
+```text
+<data_dir>/
+  identity.hex                 Reticulum private identity (0600)
+  blobs/<blake3>               raw file bytes
+  manifests/<blake3>.json      piece hashes + file metadata
+  dirs/<blake3>.json           directory listings
+  dirs/<blake3>.name           optional local display name
+  partial/<blake3>.part        resumable downloads
+  tmp/                         atomic-write staging
+  control.sock                 local RPC socket (0600)
+  daemon.log                   daemon log when auto-started
+```
+
+All writes are staged in `tmp/`, `fsync`ed, and atomically renamed. A crash leaves either the old object or the new object, never a partial blob advertised as complete. Fetched files are verified piece-by-piece and then re-hashed in full against the root before being promoted.
+
+`remove <hash>` removes that object only. Removing a directory removes its listing; child objects remain because they may be shared. There is currently no garbage collector or pinning policy.
+
+## Security model
+
+- All Reticulum links are encrypted. MeshVault additionally verifies that a peer's `Hello` identity derives the destination hash it announced, and that the link initiator identified itself on inbound links.
+- Every file piece is BLAKE3-verified as it arrives; the completed file is verified against its root hash before being stored.
+- Manifest bytes are checked against the hash advertised in the peer's inventory. Directory manifests are checked against their directory hash.
+- Directory entry names are validated and path components are sanitized before filesystem use. Directory recursion has a depth limit and cycle detection.
+- Message sizes, frame counts, inventory pages, piece requests, and reassembly state are all bounded.
+
+MeshVault is a **public sharing service**. There is no read access control: any connected peer can list your inventory and fetch any object you advertise. Names and hashes are visible to peers. The local RPC socket is the only privileged interface; keep its permissions restrictive.
+
+## Testing
+
+```sh
+cargo test --all-targets
+```
+
+The end-to-end development check runs two daemons over Reticulum TCP, adds a directory on one, lists it from the other, recursively retrieves it, and verifies byte-identical output. A 20 MiB file transferred in ~13.5 s over loopback TCP in a debug build (including resume from a partial download) with the default 500-byte Reticulum MTU.
+
+## Limitations and future work
+
+- Discovery is **peer-inventory based**, not a DHT. A file is visible if a connected peer advertises it. Reticulum handles multi-hop routing, but content discovery is bounded by the peer graph.
+- A file is fetched from one peer at a time (best hop count / SNR). Multi-source parallel fetching is a natural next step.
+- No pinning or garbage collection. Fetched files are cached indefinitely when `cache_fetched = true`.
+- No partial-directory progress sidecar; individual files resume, but already-completed files in a directory are re-exported/fail if the target exists.
+- The RPC is Unix-only and does not stream progress updates. A disconnected CLI does not cancel an in-flight daemon download.
+- Directory names are not part of the directory hash (like IPFS links); the local display name is a sidecar.
+- No encryption at rest.
+
+## License
+
+MIT.
