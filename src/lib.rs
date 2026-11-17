@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod control;
+pub mod fetch;
 pub mod hash;
 pub mod manifest;
 pub mod node;

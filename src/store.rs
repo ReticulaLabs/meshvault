@@ -642,16 +642,22 @@ impl Store {
         Ok(verified)
     }
 
-    pub fn write_piece(
+    /// Verify and write one piece at its file offset.
+    ///
+    /// Uses positional writes so several fetch workers can share one file
+    /// handle for disjoint piece ranges without seeking or locking.
+    pub fn write_piece_at(
         &self,
-        file: &mut File,
+        file: &File,
         manifest: &Manifest,
         index: u32,
         data: &[u8],
     ) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+
         manifest.verify_piece(index, data)?;
-        file.seek(SeekFrom::Start(manifest.piece_offset(index)))?;
-        file.write_all(data)?;
+        file.write_all_at(data, manifest.piece_offset(index))
+            .with_context(|| format!("write piece {index}"))?;
         Ok(())
     }
 

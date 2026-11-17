@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::config::{Config, Paths};
+use crate::fetch::PieceProgress;
 use crate::hash::ContentHash;
 use crate::manifest::{DirEntry, DirManifest, DirSummary, Manifest, ObjectKind, ObjectSummary};
 use crate::session::{Incoming, LinkSession, PeerHello};
@@ -173,6 +174,8 @@ pub struct FetchResult {
     pub path: PathBuf,
     pub bytes: u64,
     pub resumed: bool,
+    /// Peers that contributed data to this fetch.
+    pub sources: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,9 +192,24 @@ pub struct DirListing {
     pub entries: Vec<DirEntry>,
 }
 
-struct FetchState {
+#[derive(Clone, Debug)]
+struct FetchCandidate {
+    peer: AddressHash,
+    link: LinkId,
+    hops: u8,
+    snr: Option<f32>,
     manifest_hash: ContentHash,
-    verified: Vec<bool>,
+}
+
+struct SharedFetch {
+    manifest: Manifest,
+    progress: Arc<StdMutex<PieceProgress>>,
+}
+
+#[derive(Default)]
+struct WorkerStats {
+    chunks: u64,
+    bytes: u64,
 }
 
 pub struct Node {
@@ -1408,11 +1426,7 @@ impl Node {
         }
     }
 
-    async fn fetch_candidates(
-        &self,
-        root: ContentHash,
-        kind: ObjectKind,
-    ) -> Vec<(AddressHash, LinkId, u8, Option<f32>)> {
+    async fn fetch_candidates(&self, root: ContentHash, kind: ObjectKind) -> Vec<FetchCandidate> {
         let peers = self.peers.lock().await;
         let mut candidates: Vec<_> = peers
             .values()
@@ -1422,17 +1436,51 @@ impl Node {
                 if summary.kind() != kind {
                     return None;
                 }
-                Some((peer.address, peer.link?, peer.hops, peer.snr))
+                Some(FetchCandidate {
+                    peer: peer.address,
+                    link: peer.link?,
+                    hops: peer.hops,
+                    snr: peer.snr,
+                    manifest_hash: summary.manifest_hash(),
+                })
             })
             .collect();
         candidates.sort_by(|a, b| {
-            a.2.cmp(&b.2).then_with(|| {
-                b.3.unwrap_or(f32::MIN)
-                    .partial_cmp(&a.3.unwrap_or(f32::MIN))
+            a.hops.cmp(&b.hops).then_with(|| {
+                b.snr
+                    .unwrap_or(f32::MIN)
+                    .partial_cmp(&a.snr.unwrap_or(f32::MIN))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
         });
         candidates
+    }
+
+    async fn session_for_link(&self, link_id: LinkId) -> Option<Arc<LinkSession>> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(&link_id).cloned()
+    }
+
+    /// Prefer the manifest layout advertised by the most peers.  This avoids
+    /// letting one inconsistent or malicious peer choose a piece layout that
+    /// the rest of the swarm cannot verify or serve in parallel.
+    fn order_candidates_for_manifest(candidates: Vec<FetchCandidate>) -> Vec<FetchCandidate> {
+        if candidates.len() < 2 {
+            return candidates;
+        }
+        let mut counts: HashMap<ContentHash, usize> = HashMap::new();
+        for candidate in &candidates {
+            *counts.entry(candidate.manifest_hash).or_default() += 1;
+        }
+        let preferred = counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(hash, _)| hash);
+        let mut ordered = candidates;
+        if let Some(preferred) = preferred {
+            ordered.sort_by_key(|candidate| candidate.manifest_hash != preferred);
+        }
+        ordered
     }
 
     async fn fetch_lock(&self, root: ContentHash) -> Arc<Mutex<()>> {
@@ -1444,94 +1492,19 @@ impl Node {
             .clone()
     }
 
-    async fn fetch_file(
-        self: &Arc<Self>,
-        root: ContentHash,
-        output: Option<PathBuf>,
-    ) -> Result<FetchResult> {
-        let lock = self.fetch_lock(root).await;
-        let _guard = lock.lock().await;
-
-        if self.store.has_file(root) {
-            let store = self.store.clone();
-            let out = output.clone();
-            let path = tokio::task::spawn_blocking(move || store.export(root, out.as_deref()))
-                .await
-                .context("export task panicked")??;
-            let object = self
-                .store
-                .object_summary(root)
-                .context("file summary missing")?;
-            return Ok(FetchResult {
-                object,
-                path,
-                bytes: self.store.file_summary(root).map(|f| f.size).unwrap_or(0),
-                resumed: true,
-            });
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(self.config.fetch_wait_secs.max(5));
-        let mut state: Option<FetchState> = None;
-        let mut last_error: Option<anyhow::Error> = None;
-
-        loop {
-            let candidates = self.fetch_candidates(root, ObjectKind::File).await;
-            if candidates.is_empty() {
-                self.trigger_inventory_syncs().await;
-            }
-            for (peer_address, link_id, _, _) in candidates {
-                let session = {
-                    let sessions = self.sessions.lock().await;
-                    sessions.get(&link_id).cloned()
-                };
-                let Some(session) = session else {
-                    continue;
-                };
-                match self
-                    .fetch_file_from_peer(&session, peer_address, root, output.clone(), &mut state)
-                    .await
-                {
-                    Ok(result) => {
-                        self.notify_inventory_changed();
-                        return Ok(result);
-                    }
-                    Err(err) => {
-                        warn!(
-                            "peer {} failed to serve {}: {err:#}",
-                            peer_address.to_hex_string(),
-                            root.short()
-                        );
-                        if let Some(peer) = self.peers.lock().await.get_mut(&peer_address) {
-                            peer.last_error = Some(format!("{err:#}"));
-                        }
-                        last_error = Some(err);
-                    }
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(last_error
-                    .unwrap_or_else(|| anyhow!("no peer advertises file {}", root.short())));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    }
-
-    async fn fetch_file_from_peer(
-        self: &Arc<Self>,
+    async fn fetch_manifest_from(
+        &self,
         session: &Arc<LinkSession>,
-        peer_address: AddressHash,
+        peer: AddressHash,
         root: ContentHash,
-        output: Option<PathBuf>,
-        state: &mut Option<FetchState>,
-    ) -> Result<FetchResult> {
+    ) -> Result<(Manifest, ContentHash)> {
         let summary = {
             let peers = self.peers.lock().await;
             peers
-                .get(&peer_address)
+                .get(&peer)
                 .and_then(|peer| peer.object_summary(root))
                 .and_then(|object| object.file().cloned())
         };
-
         let timeout = session.transfer_timeout(64 * 1024).await;
         let response = session
             .request(Control::GetManifest { root }, timeout)
@@ -1560,121 +1533,247 @@ impl Node {
         {
             bail!("manifest does not match peer inventory");
         }
+        Ok((manifest, manifest_hash))
+    }
 
-        if let Some(existing) = state {
-            if existing.manifest_hash != manifest_hash {
-                bail!("peer served a different manifest for the same hash");
-            }
-        } else {
+    async fn fetch_file(
+        self: &Arc<Self>,
+        root: ContentHash,
+        output: Option<PathBuf>,
+    ) -> Result<FetchResult> {
+        let lock = self.fetch_lock(root).await;
+        let _guard = lock.lock().await;
+
+        if self.store.has_file(root) {
             let store = self.store.clone();
-            let manifest_for_verify = manifest.clone();
-            let verified =
-                tokio::task::spawn_blocking(move || store.verify_partial(&manifest_for_verify))
-                    .await
-                    .context("verify partial task panicked")??;
-            *state = Some(FetchState {
-                manifest_hash,
-                verified,
+            let out = output.clone();
+            let path = tokio::task::spawn_blocking(move || store.export(root, out.as_deref()))
+                .await
+                .context("export task panicked")??;
+            let object = self
+                .store
+                .object_summary(root)
+                .context("file summary missing")?;
+            return Ok(FetchResult {
+                object,
+                path,
+                bytes: self.store.file_summary(root).map(|f| f.size).unwrap_or(0),
+                resumed: true,
+                sources: Vec::new(),
             });
         }
 
-        let state = state.as_mut().unwrap();
-        let mut file = self.store.open_partial(root)?;
-        let mut bytes_since_sync = 0u64;
-        let mut last_sync = Instant::now();
-        let piece_count = manifest.piece_count();
+        let discovery_deadline =
+            Instant::now() + Duration::from_secs(self.config.fetch_wait_secs.max(5));
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut cooldown: HashMap<AddressHash, Instant> = HashMap::new();
+        let mut manifest: Option<Manifest> = None;
+        let mut manifest_hash: Option<ContentHash> = None;
+        let mut progress: Option<Arc<StdMutex<PieceProgress>>> = None;
+        let mut shared: Option<Arc<SharedFetch>> = None;
+        let mut partial: Option<Arc<std::fs::File>> = None;
+        let mut initial_verified = 0usize;
+        let mut sources: HashSet<AddressHash> = HashSet::new();
+        let mut empty_rounds = 0u32;
+        let mut announced_sources = false;
 
-        while let Some(first_missing) = state.verified.iter().position(|verified| !verified) {
-            let first_missing = first_missing as u32;
-            let mut run = 0u32;
-            while first_missing + run < piece_count
-                && !state.verified[(first_missing + run) as usize]
-            {
-                run += 1;
+        loop {
+            let candidates = self.fetch_candidates(root, ObjectKind::File).await;
+            if candidates.is_empty() {
+                self.trigger_inventory_syncs().await;
             }
 
-            let mut cursor = first_missing;
-            let run_end = first_missing + run;
-            while cursor < run_end {
-                let remaining = run_end - cursor;
-                let (mut plan, _budget) = session
-                    .chunk_plan(manifest.piece_size, remaining, self.config.max_chunk_bytes)
-                    .await?;
-                plan = plan.clamp(1, MAX_PIECES_PER_REQUEST);
-
-                let mut attempts = 0;
-                let chunk = loop {
-                    let expected_bytes = manifest.range_len(cursor, plan)? as usize;
-                    let timeout = session.transfer_timeout(expected_bytes).await;
-                    let started = Instant::now();
-                    match session
-                        .request_chunk(
-                            Control::GetChunk {
-                                root,
-                                start: cursor,
-                                count: plan,
-                            },
-                            timeout,
-                        )
+            if manifest.is_none() {
+                for candidate in &Self::order_candidates_for_manifest(candidates.clone()) {
+                    if cooldown
+                        .get(&candidate.peer)
+                        .is_some_and(|until| *until > Instant::now())
+                    {
+                        continue;
+                    }
+                    let Some(session) = self.session_for_link(candidate.link).await else {
+                        continue;
+                    };
+                    match self
+                        .fetch_manifest_from(&session, candidate.peer, root)
                         .await
                     {
-                        Ok(chunk) => {
-                            session
-                                .record_chunk(chunk.data.len(), started.elapsed())
-                                .await;
-                            break chunk;
+                        Ok((loaded, hash)) => {
+                            let store = self.store.clone();
+                            let manifest_for_verify = loaded.clone();
+                            let verified = tokio::task::spawn_blocking(move || {
+                                store.verify_partial(&manifest_for_verify)
+                            })
+                            .await
+                            .context("verify partial task panicked")??;
+                            initial_verified = verified.iter().filter(|done| **done).count();
+                            let piece_progress =
+                                Arc::new(StdMutex::new(PieceProgress::new(verified)));
+                            partial = Some(Arc::new(self.store.open_partial(root)?));
+                            shared = Some(Arc::new(SharedFetch {
+                                manifest: loaded.clone(),
+                                progress: piece_progress.clone(),
+                            }));
+                            progress = Some(piece_progress);
+                            manifest = Some(loaded);
+                            manifest_hash = Some(hash);
+                            break;
                         }
                         Err(err) => {
-                            attempts += 1;
-                            if plan <= 1 || attempts >= 3 {
-                                return Err(err).context("chunk request failed");
-                            }
-                            plan = plan.div_ceil(2).max(1);
-                            debug!(
-                                "retrying chunk {} at {} pieces after error: {err:#}",
-                                cursor, plan
+                            warn!(
+                                "peer {} cannot provide manifest for {}: {err:#}",
+                                candidate.peer.to_hex_string(),
+                                root.short()
                             );
+                            if let Some(peer) = self.peers.lock().await.get_mut(&candidate.peer) {
+                                peer.last_error = Some(format!("{err:#}"));
+                            }
+                            cooldown
+                                .insert(candidate.peer, Instant::now() + Duration::from_secs(10));
+                            last_error = Some(err);
                         }
                     }
-                };
-
-                if chunk.root != root || chunk.start != cursor {
-                    bail!("peer returned a chunk for the wrong range");
                 }
-                let actual = chunk.count;
-                if actual == 0 || actual > plan {
-                    bail!("peer returned an invalid chunk size");
+                if manifest.is_none() {
+                    if Instant::now() >= discovery_deadline {
+                        return Err(last_error.unwrap_or_else(|| {
+                            anyhow!("no peer advertises file {}", root.short())
+                        }));
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
                 }
-                let expected_len = manifest.range_len(cursor, actual)? as usize;
-                if chunk.data.len() != expected_len {
-                    bail!(
-                        "peer returned {} chunk bytes, expected {expected_len}",
-                        chunk.data.len()
-                    );
-                }
-                let mut offset = 0usize;
-                for index in cursor..cursor + actual {
-                    let len = manifest.piece_len(index)? as usize;
-                    let piece = &chunk.data[offset..offset + len];
-                    manifest.verify_piece(index, piece)?;
-                    self.store.write_piece(&mut file, &manifest, index, piece)?;
-                    state.verified[index as usize] = true;
-                    offset += len;
-                }
-                bytes_since_sync += chunk.data.len() as u64;
-                if bytes_since_sync >= 8 * 1024 * 1024
-                    || last_sync.elapsed() >= Duration::from_secs(5)
-                {
-                    file.sync_data().context("fsync partial download")?;
-                    bytes_since_sync = 0;
-                    last_sync = Instant::now();
-                }
-                cursor += actual;
             }
-        }
-        file.sync_data().context("fsync partial download")?;
-        drop(file);
 
+            let shared = shared.as_ref().context("fetch state missing")?.clone();
+            let partial = partial.as_ref().context("partial file missing")?.clone();
+            let progress = progress.as_ref().context("progress missing")?.clone();
+            let manifest_hash = manifest_hash.context("manifest hash missing")?;
+
+            if progress.lock().unwrap().all_done() {
+                break;
+            }
+            if !announced_sources {
+                info!(
+                    "fetching {} ({} pieces) from up to {} peer(s)",
+                    root.short(),
+                    shared.manifest.piece_count(),
+                    self.config.fetch_parallelism
+                );
+                announced_sources = true;
+            }
+
+            let matching: Vec<FetchCandidate> = candidates
+                .into_iter()
+                .filter(|candidate| candidate.manifest_hash == manifest_hash)
+                .collect();
+            let now = Instant::now();
+            let mut usable: Vec<FetchCandidate> = matching
+                .iter()
+                .filter(|candidate| {
+                    !cooldown
+                        .get(&candidate.peer)
+                        .is_some_and(|until| *until > now)
+                })
+                .cloned()
+                .collect();
+            if usable.is_empty() {
+                // All usable peers are cooling down; give them another
+                // chance rather than stalling forever.
+                usable = matching;
+            }
+            usable.truncate(self.config.fetch_parallelism.max(1));
+
+            if usable.is_empty() {
+                empty_rounds += 1;
+                if empty_rounds >= 6 {
+                    return Err(last_error
+                        .unwrap_or_else(|| anyhow!("no peer can serve file {}", root.short())));
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
+            let before = progress.lock().unwrap().verified_count();
+            let mut workers = tokio::task::JoinSet::new();
+            let mut spawned = 0usize;
+            for candidate in usable {
+                let Some(session) = self.session_for_link(candidate.link).await else {
+                    continue;
+                };
+                let node = self.clone();
+                let shared = shared.clone();
+                let partial = partial.clone();
+                let max_chunk_bytes = self.config.max_chunk_bytes;
+                workers.spawn(async move {
+                    let stats = node
+                        .fetch_file_worker(&session, root, &shared, &partial, max_chunk_bytes)
+                        .await;
+                    (candidate.peer, stats)
+                });
+                spawned += 1;
+            }
+
+            while let Some(joined) = workers.join_next().await {
+                match joined {
+                    Ok((peer, Ok(stats))) => {
+                        if stats.chunks > 0 {
+                            sources.insert(peer);
+                            debug!(
+                                "peer {} contributed {} chunk(s), {} bytes",
+                                peer.to_hex_string(),
+                                stats.chunks,
+                                stats.bytes
+                            );
+                        }
+                        cooldown.remove(&peer);
+                    }
+                    Ok((peer, Err(err))) => {
+                        warn!(
+                            "peer {} stopped serving {}: {err:#}",
+                            peer.to_hex_string(),
+                            root.short()
+                        );
+                        if let Some(peer_state) = self.peers.lock().await.get_mut(&peer) {
+                            peer_state.last_error = Some(format!("{err:#}"));
+                        }
+                        cooldown.insert(peer, Instant::now() + Duration::from_secs(10));
+                        last_error = Some(err);
+                    }
+                    Err(err) => {
+                        last_error = Some(anyhow!("fetch worker failed: {err}"));
+                    }
+                }
+            }
+
+            let after = progress.lock().unwrap().verified_count();
+            if after > before {
+                empty_rounds = 0;
+            } else {
+                empty_rounds += 1;
+            }
+            if progress.lock().unwrap().all_done() {
+                break;
+            }
+            if empty_rounds >= 6 {
+                return Err(
+                    last_error.unwrap_or_else(|| anyhow!("download of {} stalled", root.short()))
+                );
+            }
+            debug!(
+                "fetch progress {}/{} pieces from {} worker(s)",
+                after,
+                progress.lock().unwrap().total(),
+                spawned
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let partial = partial.context("partial file missing")?;
+        partial.sync_data().context("fsync partial download")?;
+        drop(partial);
+
+        let manifest = manifest.context("manifest missing")?;
         let store = self.store.clone();
         let manifest_for_finalize = manifest.clone();
         tokio::task::spawn_blocking(move || store.finalize_partial(&manifest_for_finalize))
@@ -1698,12 +1797,107 @@ impl Node {
             let _ = tokio::task::spawn_blocking(move || store.remove(root)).await;
         }
 
+        let mut source_list: Vec<String> = sources
+            .into_iter()
+            .map(|address| address.to_hex_string())
+            .collect();
+        source_list.sort();
+
         Ok(FetchResult {
             object,
             path,
             bytes,
-            resumed: false,
+            resumed: initial_verified > 0,
+            sources: source_list,
         })
+    }
+
+    async fn fetch_file_worker(
+        self: &Arc<Self>,
+        session: &Arc<LinkSession>,
+        root: ContentHash,
+        shared: &Arc<SharedFetch>,
+        file: &Arc<std::fs::File>,
+        max_chunk_bytes: u64,
+    ) -> Result<WorkerStats> {
+        let mut stats = WorkerStats::default();
+        loop {
+            let all_done = shared.progress.lock().unwrap().all_done();
+            if all_done {
+                break;
+            }
+            let remaining = shared.progress.lock().unwrap().remaining() as u32;
+            let (plan, _) = session
+                .chunk_plan(shared.manifest.piece_size, remaining, max_chunk_bytes)
+                .await?;
+            let mut requested = plan.clamp(1, MAX_PIECES_PER_REQUEST);
+            let mut attempts = 0u8;
+
+            loop {
+                let claim = shared.progress.lock().unwrap().claim(requested);
+                let Some((start, count)) = claim else {
+                    return Ok(stats);
+                };
+                let expected_bytes = shared.manifest.range_len(start, count)? as usize;
+                let timeout = session.transfer_timeout(expected_bytes).await;
+                let started = Instant::now();
+                match session
+                    .request_chunk(Control::GetChunk { root, start, count }, timeout)
+                    .await
+                {
+                    Ok(chunk) => {
+                        session
+                            .record_chunk(chunk.data.len(), started.elapsed())
+                            .await;
+                        match verify_and_write_chunk(
+                            &self.store,
+                            file,
+                            &shared.manifest,
+                            root,
+                            start,
+                            count,
+                            chunk,
+                        ) {
+                            Ok(bytes) => {
+                                shared.progress.lock().unwrap().complete(start, count);
+                                stats.chunks += 1;
+                                stats.bytes += bytes as u64;
+                                break;
+                            }
+                            Err(err) => {
+                                shared.progress.lock().unwrap().release(start, count);
+                                attempts += 1;
+                                if count <= 1 || attempts >= 3 {
+                                    return Err(err).context("chunk verification failed");
+                                }
+                                requested = count.div_ceil(2).max(1);
+                                debug!(
+                                    "retrying pieces {}..{} with {} piece(s): {err:#}",
+                                    start,
+                                    start + count,
+                                    requested
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        shared.progress.lock().unwrap().release(start, count);
+                        attempts += 1;
+                        if count <= 1 || attempts >= 3 {
+                            return Err(err).context("chunk request failed");
+                        }
+                        requested = count.div_ceil(2).max(1);
+                        debug!(
+                            "retrying pieces {}..{} with {} piece(s): {err:#}",
+                            start,
+                            start + count,
+                            requested
+                        );
+                    }
+                }
+            }
+        }
+        Ok(stats)
     }
 
     async fn get_dir_manifest(
@@ -1729,12 +1923,9 @@ impl Node {
         };
         let candidates = self.fetch_candidates(root, ObjectKind::Directory).await;
         let mut last_error: Option<anyhow::Error> = None;
-        for (peer_address, link_id, _, _) in candidates {
-            let session = {
-                let sessions = self.sessions.lock().await;
-                sessions.get(&link_id).cloned()
-            };
-            let Some(session) = session else {
+        for candidate in candidates {
+            let peer_address = candidate.peer;
+            let Some(session) = self.session_for_link(candidate.link).await else {
                 continue;
             };
             let timeout = session.transfer_timeout(64 * 1024).await;
@@ -2004,6 +2195,43 @@ async fn inventory_broadcast_loop(node: Arc<Node>) {
         }
         node.announce_now.notify_one();
     }
+}
+
+fn verify_and_write_chunk(
+    store: &Store,
+    file: &std::fs::File,
+    manifest: &Manifest,
+    root: ContentHash,
+    start: u32,
+    count: u32,
+    chunk: ChunkMessage,
+) -> Result<usize> {
+    if chunk.root != root || chunk.start != start || chunk.count != count {
+        bail!("peer returned a chunk for the wrong range");
+    }
+    let expected_len = manifest.range_len(start, count)? as usize;
+    if chunk.data.len() != expected_len {
+        bail!(
+            "peer returned {} chunk bytes, expected {expected_len}",
+            chunk.data.len()
+        );
+    }
+
+    // Verify the whole chunk before writing any of it, so a corrupt piece does
+    // not leave the shared progress in a half-written state.
+    let mut offset = 0usize;
+    for index in start..start + count {
+        let len = manifest.piece_len(index)? as usize;
+        manifest.verify_piece(index, &chunk.data[offset..offset + len])?;
+        offset += len;
+    }
+    let mut offset = 0usize;
+    for index in start..start + count {
+        let len = manifest.piece_len(index)? as usize;
+        store.write_piece_at(file, manifest, index, &chunk.data[offset..offset + len])?;
+        offset += len;
+    }
+    Ok(chunk.data.len())
 }
 
 // ─── Identity ───────────────────────────────────────────────────────────────

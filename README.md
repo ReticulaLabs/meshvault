@@ -12,6 +12,7 @@ Files and directory trees are identified by BLAKE3 hashes. File data is transfer
 - **Content-addressed directories.** A directory hash covers a canonical, sorted listing of names → child file/directory hashes. Listings can be fetched without downloading the contents.
 - **Recursive retrieval.** `get <directory-hash>` fetches the directory manifest and the whole tree.
 - **Bandwidth-aware transfer.** App-level selective-repeat with compact bitmap ACKs, adaptive send windows, and chunks that grow from one piece to a configured maximum based on measured throughput.
+- **Multi-source fetching.** A file is split into disjoint piece ranges and fetched from up to `fetch_parallelism` peers concurrently, with unified verification and resume.
 - **Minimal inventory traffic.** Peers exchange a 32-byte inventory digest; full inventories are only fetched when the digest changes.
 - **Crash-safe storage.** Raw blobs plus atomically written manifests. No database corruption surface; the index is rebuilt at startup.
 
@@ -140,7 +141,7 @@ Methods:
 | `status` | `{}` | node/repository status object |
 | `id` | `{}` | `{destination, identity, name}` |
 | `add` | `{path, name?}` | `{object, path}` |
-| `get` / `fetch` | `{hash, output?}` | `{object, path, bytes}` |
+| `get` / `fetch` | `{hash, output?}` | `{object, path, bytes, resumed, sources}` |
 | `ls` / `list` | `{}` or `{hash}` | local object array, or `{root, name, entries}` |
 | `remove` | `{hash}` | boolean |
 | `peers` | `{}` | peer array |
@@ -161,6 +162,7 @@ max_links = 64                   # total links
 piece_size = 16384               # hashing/verification piece size
 max_chunk_bytes = 1048576        # cap for one adaptive transfer message
 fetch_wait_secs = 20             # how long get waits for a peer/inventory
+fetch_parallelism = 4            # parallel source peers per file (1 disables)
 cache_fetched = true             # keep and advertise fetched content
 transport_node = false           # forward traffic for other Reticulum nodes
 link_mtu_discovery = false       # keep interoperable 500-byte Reticulum MTU
@@ -214,14 +216,16 @@ MeshVault is a **public sharing service**. There is no read access control: any 
 cargo test --all-targets
 ```
 
-The end-to-end development check runs two daemons over Reticulum TCP, adds a directory on one, lists it from the other, recursively retrieves it, and verifies byte-identical output. A 20 MiB file transferred in ~13.5 s over loopback TCP in a debug build (including resume from a partial download) with the default 500-byte Reticulum MTU.
+The end-to-end development check runs daemons over Reticulum TCP, adds files/directories on one node, lists and retrieves them from another, and verifies byte-identical output. A 16 MiB file fetched from two peers concurrently completed in ~0.43 s over loopback TCP in a release build with the default 500-byte Reticulum MTU; each source contributed roughly half the pieces. A 20 MiB single-source debug transfer with resume completed in ~13.5 s.
 
 ## Limitations and future work
 
 - Discovery is **peer-inventory based**, not a DHT. A file is visible if a connected peer advertises it. Reticulum handles multi-hop routing, but content discovery is bounded by the peer graph.
-- A file is fetched from one peer at a time (best hop count / SNR). Multi-source parallel fetching is a natural next step.
+- Multi-source fetching is bounded by `fetch_parallelism`. Peers are selected by hop count then SNR, and a failing peer enters a short cooldown; there is no long-term reputation or bandwidth accounting.
+- Parallel sources must advertise the same manifest hash, which means the same piece size/layout. A peer that imported the file with a different `piece_size` is excluded from that fetch.
 - No pinning or garbage collection. Fetched files are cached indefinitely when `cache_fetched = true`.
 - No partial-directory progress sidecar; individual files resume, but already-completed files in a directory are re-exported/fail if the target exists.
+- Pieces are fetched in adaptive contiguous ranges, not individual pieces, which keeps protocol overhead low but can leave an under-filled tail when one source is much slower.
 - The RPC is Unix-only and does not stream progress updates. A disconnected CLI does not cancel an in-flight daemon download.
 - Directory names are not part of the directory hash (like IPFS links); the local display name is a sidecar.
 - No encryption at rest.

@@ -36,6 +36,8 @@ pub struct Config {
     pub max_chunk_bytes: u64,
     /// How long `get` waits for a peer/inventory to show up.
     pub fetch_wait_secs: u64,
+    /// Maximum number of peers used in parallel for one file fetch.
+    pub fetch_parallelism: usize,
     /// Keep and advertise files fetched from the mesh.
     pub cache_fetched: bool,
 
@@ -73,6 +75,7 @@ impl Default for Config {
             piece_size: crate::manifest::DEFAULT_PIECE_SIZE,
             max_chunk_bytes: 1024 * 1024,
             fetch_wait_secs: 20,
+            fetch_parallelism: 4,
             cache_fetched: true,
             transport_node: false,
             link_mtu_discovery: false,
@@ -241,6 +244,10 @@ max_chunk_bytes = 1048576
 
 # How long `meshvault get` waits for a peer to advertise the requested hash.
 fetch_wait_secs = 20
+
+# Fetch one file from up to this many peers in parallel.  Set to 1 to disable
+# multi-source fetching.
+fetch_parallelism = 4
 
 # Keep files fetched from the mesh and advertise them to other peers.
 cache_fetched = true

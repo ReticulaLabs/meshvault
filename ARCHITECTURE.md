@@ -11,7 +11,7 @@ This document explains the design decisions, wire protocol, storage model, and f
 5. **Be a good mesh citizen.** Bounded peers, bounded link count, bounded message sizes, bounded reassembly memory, paced transfers.
 6. **Be simple to operate.** One daemon, one local socket, automatic announce/peer/reconnect/cache behavior.
 
-Non-goals for this version: a global DHT, anonymity, access control, and multi-source swarms.
+Non-goals for this version: a global DHT, anonymity, access control, and tit-for-tat swarm accounting.
 
 ## Component overview
 
@@ -227,6 +227,22 @@ Consequences:
 - On LoRa, the measured rate keeps the chunk at one piece and the window small.
 - One chunk per link is in flight, which simplifies memory bounds and fairness; the adaptive chunk size keeps the pipe reasonably full.
 
+### Multi-source piece scheduling
+
+`PieceProgress` holds two bitmaps: `verified` and `claimed`. A worker claims the first contiguous run of pieces that is neither verified nor claimed, up to its link's chunk plan. Claims are released on failure and marked verified only after the entire chunk has been verified and written.
+
+This gives:
+
+- **No overlapping writes** — workers own disjoint byte ranges.
+- **No duplicate work** — a piece is only requested from one peer at a time.
+- **Resume compatibility** — pieces already present in the partial file are marked verified before workers start.
+- **Failure isolation** — a slow or dishonest peer only loses its claimed range.
+- **Bounded state** — two bits per piece plus the manifest, independent of the number of sources.
+
+For a contiguous range, a worker verifies all pieces in memory before writing any of them. If one piece fails, the whole range is released and retried smaller; no half-verified range is recorded.
+
+The manifest layout is chosen by majority preference among candidates. A file root is the same regardless of piece size, but piece hashes are not, so only peers advertising the same manifest hash participate in a given parallel fetch.
+
 ### Control messages
 
 Control payloads are MessagePack. The envelope distinguishes requests from responses explicitly:
@@ -259,20 +275,22 @@ Chunk bodies have a 44-byte header (request id, 32-byte root, start piece, piece
 
 ## Fetch flow
 
-### File
+### File (multi-source)
 
 1. Resolve the root locally or in a connected peer's inventory.
-2. Request the file manifest from the best candidate (fewest hops, then best SNR).
-3. Verify the manifest hash against the inventory entry.
-4. Verify which pieces already exist in `partial/<root>.part`.
-5. Loop over contiguous missing piece ranges:
-   - choose a chunk size from the link budget
-   - request the range
-   - verify every piece against the manifest
-   - write verified pieces at their byte offsets
-   - periodically `fsync`
-6. On a request failure, retry the range with half the pieces; after repeated failure, try the next peer and resume from the same partial file.
-7. Verify the completed file's full BLAKE3 hash, atomically promote it to `blobs/`, write the manifest, cache/advertise if configured, and export to the requested output path.
+2. Request the file manifest once from the best candidate (fewest hops, then best SNR).
+3. Verify the manifest hash against the inventory entry, then discard candidates whose advertised manifest hash differs.
+4. Verify which pieces already exist in `partial/<root>.part`; this becomes the initial shared bitmap.
+5. Start up to `fetch_parallelism` workers, one per peer. Each worker:
+   - asks its link for an adaptive chunk plan
+   - atomically claims a disjoint contiguous range of missing pieces
+   - requests that range and verifies every piece before writing any of them
+   - writes pieces with positional `pwrite` calls into the shared partial file
+   - marks the range verified and claims the next range
+6. A failed range is released back to the pool and retried with half as many pieces (up to three attempts on that peer). If the peer still fails, it enters a short cooldown and other workers continue.
+7. When every piece is verified, `fsync` the partial file, verify the full BLAKE3 root, atomically promote it to `blobs/`, write the manifest, cache/advertise if configured, and export to the output path.
+
+Workers never overlap piece ranges, and verification-before-write prevents a corrupt chunk from leaving partial state in the shared progress bitmap. The partial file is opened once and shared; `write_at`/`pwrite` avoids seeks and cross-worker locking.
 
 ### Directory
 
@@ -314,9 +332,11 @@ Startup behavior:
 
 Reticulum can prove every link data packet, but on a 431-byte frame a proof is a large fraction of the payload. MeshVault proves **application messages** with a bitmap instead. The trade-off is that we implement retransmission and flow control, but we gain selective repeat and much lower overhead on constrained links.
 
-### One chunk in flight per link
+### One chunk in flight per link, several links in parallel
 
-This keeps memory bounded and avoids competing streams starving each other. Chunk size is used to fill the link instead of many parallel requests. Multi-peer or multi-stream fetching could be added later.
+Each link has one reliable chunk message in flight at a time, which keeps memory bounded and avoids streams starving each other. Aggregate throughput comes from fetching disjoint ranges from several peers concurrently. Chunk size is used to fill each individual link.
+
+`fetch_parallelism` bounds the number of peers per file. Candidates are ordered by hop count then SNR; failures trigger a short cooldown so one bad peer does not repeatedly receive large requests.
 
 ### Fixed piece size, variable chunk size
 
@@ -339,7 +359,8 @@ Larger Reticulum link packets can improve TCP throughput, but are not reliable a
 | Failure | Behavior |
 |---|---|
 | Announce missed | Path/retry handled by Reticulum; periodic announces re-advertise. |
-| Link drops mid-transfer | Session closes; fetch retries another peer; partial pieces remain. |
+| Link drops mid-transfer | Session closes; that worker's claimed range is released, other workers continue, and later rounds retry it. |
+| One source is slow/fails | Its claimed ranges return to the pool; remaining sources finish them. A failed peer cools down for 10 s. |
 | Peer sends corrupt data | Piece hash fails; peer is recorded with a last error; retry/other peer. |
 | Peer sends wrong manifest | Manifest hash/inventory mismatch rejects it. |
 | Duplicate links | Smaller link id kept, other torn down. |
@@ -353,7 +374,8 @@ Larger Reticulum link packets can improve TCP throughput, but are not reliable a
 
 Measured on loopback TCP through Reticulum with the default 500-byte MTU:
 
-- 20 MiB file: ~13.5 s including resume from a 1.7 MiB partial download (debug build, single peer, one chunk in flight) ≈ 1.5 MiB/s.
+- 16 MiB file from two peers: ~0.43 s over loopback TCP (release build), with each source contributing roughly half the pieces.
+- 20 MiB file: ~13.5 s including resume from a 1.7 MiB partial download (debug build, single peer) ≈ 1.5 MiB/s.
 - Small file/listing/metadata operations complete in milliseconds on a healthy link.
 - Idle two-node mesh exchanges periodic 60–900 s announces plus a tiny inventory digest; no full inventory transfer unless content changes.
 
@@ -361,7 +383,7 @@ Release builds and larger link MTUs (where supported) will improve TCP throughpu
 
 ## Future work
 
-- Multi-peer parallel piece retrieval and peer scoring.
+- Longer-term peer scoring/reputation and bandwidth accounting.
 - DHT or gossip-based content discovery beyond connected-peer inventories.
 - Pinning/GC policy and repository quotas.
 - Streaming progress over RPC and cancelable fetches.
