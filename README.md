@@ -26,6 +26,45 @@ cargo build --release
 
 Requirements: Rust 1.85+ (edition 2024), Linux for the Unix-socket RPC service.
 
+## Docker
+
+The repository includes an Alpine-based multi-stage `Dockerfile`. The image runs as an unprivileged `meshvault` user, stores repository data in `/var/lib/meshvault`, and reads configuration from `/etc/meshvault/config.toml`.
+
+```sh
+docker build -t meshvault .
+
+# Create a config on the host, then run the service.
+docker run -d --name meshvault \
+  --restart unless-stopped \
+  -p 4243:4243 \
+  -v meshvault-data:/var/lib/meshvault \
+  -v "$PWD/config.toml:/etc/meshvault/config.toml:ro" \
+  meshvault
+```
+
+A container-oriented config usually listens on all interfaces and connects to a Reticulum router on the host:
+
+```toml
+name = "docker-node"
+fetch_parallelism = 4
+
+[interfaces]
+listen = ["0.0.0.0:4243"]
+connect = ["host.docker.internal:4242"]
+```
+
+On Linux, add `--add-host=host.docker.internal:host-gateway` to reach a router on the host. If you do not mount a config, the container writes a default one and runs isolated until you provide interfaces. If you bind-mount a data directory instead of using a named volume, make it writable by the container's unprivileged `meshvault` user.
+
+The CLI can be used inside the running container:
+
+```sh
+docker exec meshvault meshvault status
+docker exec meshvault meshvault add /var/lib/meshvault/import/somefile
+docker exec meshvault meshvault get <hash> -o /var/lib/meshvault/import/out
+```
+
+The RPC socket lives at `/var/lib/meshvault/control.sock`. The bundled build uses Reticulum's network-only features (TCP client/server); connect it to a Reticulum transport node that carries LoRa, serial, or other interfaces.
+
 ## Quick start
 
 1. Create a configuration:
