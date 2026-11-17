@@ -82,7 +82,7 @@ The payload is kept under 280 bytes; the name is dropped if necessary. The inven
 
 Both nodes may initiate simultaneously. Each side keeps the **lexicographically smaller link id** and closes the other. This converges without a coordinator. The kept link is the only one used for inventory and transfers.
 
-Links are bounded by `max_peers` (outbound and pending), `max_links` (total), and `max_known_peers` (retained peer records). Stale disconnected peers are evicted after one hour. Reticulum handles path discovery, multi-hop routing, encryption, and link keepalives.
+The daemon acquires an exclusive lock on `daemon.lock` in the data directory before opening the identity or repository. A second daemon for the same repository fails to start, and an RPC bind failure is fatal. Links are bounded by `max_peers` (outbound and pending), `max_links` (total), and `max_known_peers` (retained peer records). Stale disconnected peers are evicted after one hour. Reticulum handles path discovery, multi-hop routing, encryption, and link keepalives.
 
 ## Content model
 
@@ -381,6 +381,8 @@ Independently of that option, inbound links are rejected if their signalled MTU 
 | Inventory changes during pagination | Sync aborts and retries on the next announce/notification. |
 | Disk crash mid-import/fetch | Only `tmp/` staging is lost; existing objects remain valid. |
 | Crash after blob write before manifest | Orphan blob reported at startup; can be re-imported. |
+| Second daemon on same repository | Exits immediately because `daemon.lock` is held. |
+| Concurrent CLI auto-start | Losing daemon exits; clients keep polling for the winner's RPC socket. |
 | Malicious directory cycle | Recursion stack detects and aborts. |
 | Oversized request | Bounded before allocation/read. |
 

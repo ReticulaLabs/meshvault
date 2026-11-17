@@ -12,6 +12,7 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 env_logger = "0.11"
+fs2 = "0.4"
 getrandom = { version = "0.4", features = ["sys_rng"] }
 hex = "0.4"
 log = "0.4"

@@ -161,7 +161,7 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Use `meshvault init` once as that user (or set `data_dir`/`control_socket` explicitly in `/etc/meshvault/config.toml`).
+Use `meshvault init` once as that user (or set `data_dir`/`control_socket` explicitly in `/etc/meshvault/config.toml`). The daemon takes an exclusive `daemon.lock` in the data directory before touching the identity or repository, so a second daemon for the same repository exits immediately. RPC bind failures are fatal.
 
 ## Local RPC
 
@@ -229,6 +229,7 @@ This build configures Reticulum **TCP client/server** interfaces. Point `connect
 ```text
 <data_dir>/
   identity.hex                 Reticulum private identity (0600)
+  daemon.lock                  exclusive single-instance lock (0600)
   blobs/<blake3>               raw file bytes
   manifests/<blake3>.json      piece hashes + file metadata
   dirs/<blake3>.json           directory listings

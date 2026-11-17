@@ -1,6 +1,6 @@
 //! MeshVault command line and service entry point.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -289,13 +289,9 @@ async fn run_daemon(config: Config, paths: meshvault::config::Paths) -> Result<(
     );
     log::info!("control socket: {}", paths.control_socket.display());
 
-    let socket = paths.control_socket.clone();
-    let rpc_node = node.clone();
-    tokio::spawn(async move {
-        if let Err(err) = control::serve(rpc_node, &socket).await {
-            log::error!("RPC server failed: {err:#}");
-        }
-    });
+    let listener = control::bind(&paths.control_socket).await?;
+    let rpc = control::serve(node, listener);
+    tokio::pin!(rpc);
 
     #[cfg(unix)]
     {
@@ -303,12 +299,22 @@ async fn run_daemon(config: Config, paths: meshvault::config::Paths) -> Result<(
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .context("install SIGTERM handler")?;
         tokio::select! {
+            result = &mut rpc => {
+                result.context("RPC server failed")?;
+                bail!("RPC server stopped unexpectedly");
+            }
             result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C")?,
             _ = terminate.recv() => {}
         }
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
+    tokio::select! {
+        result = &mut rpc => {
+            result.context("RPC server failed")?;
+            bail!("RPC server stopped unexpectedly");
+        }
+        result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C")?,
+    }
 
     log::info!("shutting down");
     Ok(())

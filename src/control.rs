@@ -42,8 +42,10 @@ struct RpcResponse {
     error: Option<String>,
 }
 
-/// Bind the RPC socket and serve until the process exits.
-pub async fn serve(node: Arc<Node>, socket: &Path) -> Result<()> {
+/// Bind the RPC socket, removing a stale socket but never stealing one from a
+/// live daemon.  Returns the listener so the caller can treat bind/serve
+/// failures as fatal.
+pub async fn bind(socket: &Path) -> Result<UnixListener> {
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create RPC socket directory {}", parent.display()))?;
@@ -63,10 +65,15 @@ pub async fn serve(node: Arc<Node>, socket: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure RPC socket {}", socket.display()))?;
     }
     log::info!("RPC listening on {}", socket.display());
+    Ok(listener)
+}
 
+/// Accept RPC connections until the listener fails.
+pub async fn serve(node: Arc<Node>, listener: UnixListener) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await.context("accept RPC connection")?;
         let node = node.clone();
@@ -264,20 +271,35 @@ pub async fn client_for(paths: &Paths) -> Result<RpcClient> {
         .stderr(log_clone);
     let mut child = command.spawn().context("start meshvault daemon")?;
 
-    // Wait for the socket to accept a ping.  If the child exits immediately,
-    // report the log location instead of waiting the full timeout.
+    // Wait for the socket to accept a ping.  The spawned daemon may lose the
+    // data-directory lock to another daemon that is already starting; in that
+    // case keep polling briefly so the winner's socket can come up.
+    let mut child_status = None;
+    let mut loops_after_exit = 0;
     for _ in 0..80 {
         if ping(socket).await {
             log::debug!("started daemon (pid {})", child.id());
             return RpcClient::connect(socket).await;
         }
-        if let Ok(Some(status)) = child.try_wait() {
-            bail!(
-                "daemon exited during startup ({status}); see {}",
-                log_path.display()
-            );
+        if child_status.is_none()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            child_status = Some(status);
+        }
+        if child_status.is_some() {
+            loops_after_exit += 1;
+            // Keep waiting for the winner of a concurrent auto-start race.
+            if loops_after_exit >= 80 {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if let Some(status) = child_status {
+        bail!(
+            "daemon exited during startup ({status}); another daemon may be starting, or see {}",
+            log_path.display()
+        );
     }
     bail!(
         "daemon did not start within 20s; see {}",

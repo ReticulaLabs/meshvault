@@ -2,9 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
+
+use fs2::FileExt;
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::{debug, info, warn};
@@ -31,6 +34,7 @@ use crate::wire::{
 };
 
 const IDENTITY_FILE: &str = "identity.hex";
+const DAEMON_LOCK_FILE: &str = "daemon.lock";
 const ANNOUNCE_PAYLOAD_LIMIT: usize = 280;
 const MAX_DIRECTORY_DEPTH: usize = 64;
 const SESSION_INCOMING_QUEUE: usize = 32;
@@ -69,6 +73,43 @@ fn ensure_peer_slot(
             true
         }
         None => false,
+    }
+}
+
+/// Held for the daemon's lifetime.  The OS releases the lock on process exit.
+struct DataDirLock {
+    _file: fs::File,
+}
+
+impl DataDirLock {
+    fn acquire(data_dir: &Path) -> Result<Self> {
+        let path = data_dir.join(DAEMON_LOCK_FILE);
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("open daemon lock {}", path.display()))?;
+        file.try_lock_exclusive().map_err(|err| {
+            anyhow!(
+                "another meshvault daemon is already running for {} ({err})",
+                data_dir.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("secure daemon lock {}", path.display()))?;
+        }
+        file.set_len(0).context("truncate daemon lock")?;
+        writeln!(file, "{}", std::process::id()).context("write daemon lock pid")?;
+        file.sync_data().context("sync daemon lock")?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -247,6 +288,7 @@ pub struct Node {
     pub transport: Transport,
     pub store: Arc<Store>,
     memory_budget: Arc<MemoryBudget>,
+    _daemon_lock: DataDirLock,
     destination_hash: AddressHash,
     started_at: Instant,
     peers: Mutex<HashMap<AddressHash, PeerState>>,
@@ -265,6 +307,7 @@ impl Node {
     pub async fn start(config: Config, paths: Paths) -> Result<Arc<Self>> {
         fs::create_dir_all(&paths.data_dir)
             .with_context(|| format!("create data directory {}", paths.data_dir.display()))?;
+        let daemon_lock = DataDirLock::acquire(&paths.data_dir)?;
         let identity = load_identity(&paths.data_dir)?;
         let store = Arc::new(Store::open(&paths.data_dir)?);
         let memory_budget = Arc::new(MemoryBudget::new(config.max_inbound_memory_bytes as usize));
@@ -319,6 +362,7 @@ impl Node {
             transport,
             store,
             memory_budget,
+            _daemon_lock: daemon_lock,
             destination_hash,
             started_at: Instant::now(),
             peers: Mutex::new(HashMap::new()),
@@ -2399,4 +2443,19 @@ fn write_identity(path: &Path, identity: &PrivateIdentity) -> Result<()> {
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_lock_is_exclusive_and_released_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = DataDirLock::acquire(temp.path()).unwrap();
+        assert!(DataDirLock::acquire(temp.path()).is_err());
+        drop(first);
+        let second = DataDirLock::acquire(temp.path()).unwrap();
+        drop(second);
+    }
 }
