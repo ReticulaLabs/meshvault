@@ -28,6 +28,8 @@ pub struct Config {
     pub max_peers: usize,
     /// Maximum total links (inbound + outbound).
     pub max_links: usize,
+    /// Maximum peer records retained (connected or discovered).
+    pub max_known_peers: usize,
 
     /// Piece size used when importing files. Hashes in manifests depend on
     /// this value.
@@ -38,6 +40,12 @@ pub struct Config {
     pub fetch_wait_secs: u64,
     /// Maximum number of peers used in parallel for one file fetch.
     pub fetch_parallelism: usize,
+    /// Maximum inventory entries accepted from one peer.
+    pub max_inventory_objects: usize,
+    /// Maximum inventory entries retained across all peers.
+    pub max_inventory_objects_total: usize,
+    /// Process-wide budget for inbound reassembly buffers.
+    pub max_inbound_memory_bytes: u64,
     /// Keep and advertise files fetched from the mesh.
     pub cache_fetched: bool,
 
@@ -72,10 +80,14 @@ impl Default for Config {
             announce_interval_secs: 1800,
             max_peers: 8,
             max_links: 64,
+            max_known_peers: 512,
             piece_size: crate::manifest::DEFAULT_PIECE_SIZE,
             max_chunk_bytes: 1024 * 1024,
             fetch_wait_secs: 20,
             fetch_parallelism: 4,
+            max_inventory_objects: 16_384,
+            max_inventory_objects_total: 65_536,
+            max_inbound_memory_bytes: 64 * 1024 * 1024,
             cache_fetched: true,
             transport_node: false,
             link_mtu_discovery: false,
@@ -171,6 +183,23 @@ impl Config {
         if self.max_links == 0 || self.max_links < self.max_peers {
             bail!("max_links must be at least max_peers");
         }
+        if self.max_known_peers < self.max_peers {
+            bail!("max_known_peers must be at least max_peers");
+        }
+        if self.max_known_peers > 1_000_000 {
+            bail!("max_known_peers is unreasonably large");
+        }
+        if self.max_inventory_objects == 0
+            || self.max_inventory_objects_total < self.max_inventory_objects
+        {
+            bail!("max_inventory_objects_total must be at least max_inventory_objects");
+        }
+        if self.max_inventory_objects_total > 4_000_000 {
+            bail!("max_inventory_objects_total is unreasonably large");
+        }
+        if !(4 * 1024 * 1024..=1024 * 1024 * 1024).contains(&self.max_inbound_memory_bytes) {
+            bail!("max_inbound_memory_bytes must be between 4 MiB and 1 GiB");
+        }
         if !(MIN_PIECE_SIZE..=MAX_PIECE_SIZE).contains(&self.piece_size) {
             bail!("piece_size must be between {MIN_PIECE_SIZE} and {MAX_PIECE_SIZE}");
         }
@@ -234,6 +263,18 @@ announce_interval_secs = 1800
 # Maximum outbound peer links, and maximum links in total.
 max_peers = 8
 max_links = 64
+
+# Maximum peer records retained. Stale disconnected peers are evicted.
+max_known_peers = 512
+
+# Inventory caps. Peers with larger inventories will not be fully synced;
+# raise these for repositories with many files.
+max_inventory_objects = 16384
+max_inventory_objects_total = 65536
+
+# Process-wide budget for inbound message reassembly. Individual links are
+# additionally capped at 4 MiB in flight.
+max_inbound_memory_bytes = 67108864
 
 # Files are stored as fixed-size hashed pieces.  16 KiB is a good default for
 # mixed LAN/LoRa meshes.

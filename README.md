@@ -198,10 +198,14 @@ name = "my-node"                 # optional friendly name announced to peers
 announce_interval_secs = 900     # minimum 60
 max_peers = 8                    # outbound links
 max_links = 64                   # total links
+max_known_peers = 512            # retained peer records
 piece_size = 16384               # hashing/verification piece size
 max_chunk_bytes = 1048576        # cap for one adaptive transfer message
 fetch_wait_secs = 20             # how long get waits for a peer/inventory
 fetch_parallelism = 4            # parallel source peers per file (1 disables)
+max_inventory_objects = 16384    # inventory entries accepted per peer
+max_inventory_objects_total = 65536  # inventory entries across all peers
+max_inbound_memory_bytes = 67108864  # 64 MiB global reassembly budget
 cache_fetched = true             # keep and advertise fetched content
 transport_node = false           # forward traffic for other Reticulum nodes
 link_mtu_discovery = false       # keep interoperable 500-byte Reticulum MTU
@@ -262,6 +266,8 @@ The end-to-end development check runs daemons over Reticulum TCP, adds files/dir
 - Discovery is **peer-inventory based**, not a DHT. A file is visible if a connected peer advertises it. Reticulum handles multi-hop routing, but content discovery is bounded by the peer graph.
 - Multi-source fetching is bounded by `fetch_parallelism`. Peers are selected by hop count then SNR, and a failing peer enters a short cooldown; there is no long-term reputation or bandwidth accounting.
 - Parallel sources must advertise the same manifest hash, which means the same piece size/layout. A peer that imported the file with a different `piece_size` is excluded from that fetch.
+- Peers with more than `max_inventory_objects` entries are not fully synchronized; raise that limit (and `max_inventory_objects_total`) for repositories with many files. Disconnected peers are evicted after one hour, and the retained peer table is capped by `max_known_peers`.
+- Inbound reassembly is bounded per link (4 MiB) and globally by `max_inbound_memory_bytes`; frames that would exceed the global budget are dropped and retried by the sender.
 - No pinning or garbage collection. Fetched files are cached indefinitely when `cache_fetched = true`.
 - No partial-directory progress sidecar; individual files resume, but already-completed files in a directory are re-exported/fail if the target exists.
 - Pieces are fetched in adaptive contiguous ranges, not individual pieces, which keeps protocol overhead low but can leave an under-filled tail when one source is much slower.

@@ -24,7 +24,7 @@ use crate::config::{Config, Paths};
 use crate::fetch::PieceProgress;
 use crate::hash::ContentHash;
 use crate::manifest::{DirEntry, DirManifest, DirSummary, Manifest, ObjectKind, ObjectSummary};
-use crate::session::{Incoming, LinkSession, MAX_LINK_MTU, PeerHello};
+use crate::session::{Incoming, LinkSession, MAX_LINK_MTU, MemoryBudget, PeerHello};
 use crate::store::{MAX_PIECES_PER_REQUEST, Store, sanitize_name};
 use crate::wire::{
     CHUNK_HEADER_LEN, ChunkMessage, Control, INVENTORY_PAGE_SIZE, NodeAnnounce, PROTOCOL_VERSION,
@@ -33,7 +33,8 @@ use crate::wire::{
 const IDENTITY_FILE: &str = "identity.hex";
 const ANNOUNCE_PAYLOAD_LIMIT: usize = 280;
 const MAX_DIRECTORY_DEPTH: usize = 64;
-const MAX_INVENTORY_PAGES: u32 = 4096;
+const SESSION_INCOMING_QUEUE: usize = 32;
+const PEER_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 pub fn destination_name() -> DestinationName {
     DestinationName::new("meshvault", "node")
@@ -47,6 +48,28 @@ fn clean_name(name: Option<String>) -> Option<String> {
             .collect::<String>()
     })
     .filter(|name| !name.is_empty())
+}
+
+fn ensure_peer_slot(
+    peers: &mut HashMap<AddressHash, PeerState>,
+    address: AddressHash,
+    limit: usize,
+) -> bool {
+    if peers.contains_key(&address) || peers.len() < limit {
+        return true;
+    }
+    let victim = peers
+        .values()
+        .filter(|peer| peer.link.is_none())
+        .min_by_key(|peer| peer.last_seen)
+        .map(|peer| peer.address);
+    match victim {
+        Some(victim) => {
+            peers.remove(&victim);
+            true
+        }
+        None => false,
+    }
 }
 
 struct HelloPayload {
@@ -157,6 +180,10 @@ pub struct NodeStatus {
     pub peers_connected: usize,
     pub links: usize,
     pub outbound_links: usize,
+    pub inbound_buffer_bytes: usize,
+    pub inbound_buffer_limit: usize,
+    pub known_peer_limit: usize,
+    pub inventory_object_limit: usize,
     pub transport_node: bool,
     pub connect: Vec<String>,
     pub listen: Vec<String>,
@@ -219,6 +246,7 @@ pub struct Node {
     pub destination: Arc<Mutex<SingleInputDestination>>,
     pub transport: Transport,
     pub store: Arc<Store>,
+    memory_budget: Arc<MemoryBudget>,
     destination_hash: AddressHash,
     started_at: Instant,
     peers: Mutex<HashMap<AddressHash, PeerState>>,
@@ -239,6 +267,7 @@ impl Node {
             .with_context(|| format!("create data directory {}", paths.data_dir.display()))?;
         let identity = load_identity(&paths.data_dir)?;
         let store = Arc::new(Store::open(&paths.data_dir)?);
+        let memory_budget = Arc::new(MemoryBudget::new(config.max_inbound_memory_bytes as usize));
 
         let mut transport_config =
             TransportConfig::new("meshvault", &identity, config.transport_node);
@@ -289,6 +318,7 @@ impl Node {
             destination,
             transport,
             store,
+            memory_budget,
             destination_hash,
             started_at: Instant::now(),
             peers: Mutex::new(HashMap::new()),
@@ -529,6 +559,30 @@ impl Node {
 
         let (is_new, connected) = {
             let mut peers = self.peers.lock().await;
+            if !peers.contains_key(&desc.address_hash) && peers.len() >= self.config.max_known_peers
+            {
+                let victim = peers
+                    .values()
+                    .filter(|peer| peer.link.is_none())
+                    .min_by_key(|peer| peer.last_seen)
+                    .map(|peer| peer.address);
+                match victim {
+                    Some(address) => {
+                        peers.remove(&address);
+                        debug!(
+                            "peer cap reached; evicted stale peer {}",
+                            address.to_hex_string()
+                        );
+                    }
+                    None => {
+                        debug!(
+                            "peer cap reached and all known peers are connected; ignoring announce from {}",
+                            desc.address_hash.to_hex_string()
+                        );
+                        return;
+                    }
+                }
+            }
             let peer = peers
                 .entry(desc.address_hash)
                 .or_insert_with(|| PeerState::new(desc.address_hash));
@@ -574,18 +628,6 @@ impl Node {
         let Some(desc) = desc else {
             return;
         };
-        {
-            let mut connecting = self.connecting.lock().await;
-            if connecting
-                .get(&address)
-                .map(|started| started.elapsed() < Duration::from_secs(90))
-                .unwrap_or(false)
-            {
-                return;
-            }
-            connecting.insert(address, Instant::now());
-        }
-
         let outbound = self
             .sessions
             .lock()
@@ -593,9 +635,20 @@ impl Node {
             .values()
             .filter(|session| session.outbound)
             .count();
-        if outbound >= self.config.max_peers {
-            self.connecting.lock().await.remove(&address);
-            return;
+        {
+            let mut connecting = self.connecting.lock().await;
+            connecting.retain(|_, started| started.elapsed() < Duration::from_secs(120));
+            if connecting
+                .get(&address)
+                .map(|started| started.elapsed() < Duration::from_secs(90))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            if outbound.saturating_add(connecting.len()) >= self.config.max_peers {
+                return;
+            }
+            connecting.insert(address, Instant::now());
         }
 
         info!("connecting to peer {}", address.to_hex_string());
@@ -669,7 +722,7 @@ impl Node {
             .verified_peer()
             .await
             .context("peer identity is not bound to the link")?;
-        let local_inventory = self.store.inventory();
+        let local_count = self.store.file_count() + self.store.dir_count();
         let local_digest = self.store.inventory_digest();
         let expected_digest = {
             let peers = self.peers.lock().await;
@@ -686,23 +739,26 @@ impl Node {
             local_digest.short()
         );
         if expected_digest == Some(local_digest) {
+            // Identical digest means both sides have the same object set.  The
+            // local store is authoritative, so keep the peer's inventory map
+            // empty instead of cloning a potentially huge local inventory.
             let mut peers = self.peers.lock().await;
             if let Some(peer) = peers.get_mut(&peer_address) {
-                peer.inventory = local_inventory
-                    .into_iter()
-                    .map(|object| (object.root(), object))
-                    .collect();
+                peer.inventory.clear();
                 peer.inventory_synced = true;
                 peer.inventory_digest = Some(local_digest);
+                peer.objects = local_count as u32;
             }
             return Ok(());
         }
 
+        let max_objects = self.config.max_inventory_objects;
+        let max_pages = (max_objects as u32).div_ceil(INVENTORY_PAGE_SIZE).max(1);
         let mut objects = HashMap::new();
         let mut snapshot = None;
         let mut page = 0u32;
         loop {
-            if page >= MAX_INVENTORY_PAGES {
+            if page >= max_pages {
                 bail!("peer inventory has too many pages");
             }
             debug!("requesting inventory page {page} over {link_id}");
@@ -721,8 +777,11 @@ impl Node {
             else {
                 bail!("unexpected inventory response");
             };
-            if got_page != page || pages == 0 {
-                bail!("invalid inventory page response");
+            if got_page != page || pages == 0 || pages > max_pages {
+                bail!("invalid or oversized inventory page response");
+            }
+            if entries.len() > INVENTORY_PAGE_SIZE as usize {
+                bail!("inventory page has too many entries");
             }
             if let Some(snapshot) = snapshot {
                 if inventory != snapshot {
@@ -731,10 +790,10 @@ impl Node {
             } else {
                 snapshot = Some(inventory);
             }
+            if objects.len().saturating_add(entries.len()) > max_objects {
+                bail!("peer inventory exceeds max_inventory_objects");
+            }
             for object in entries {
-                if objects.len() >= 1_000_000 {
-                    bail!("peer inventory is too large");
-                }
                 objects.insert(object.root(), object);
             }
             page += 1;
@@ -744,6 +803,14 @@ impl Node {
         }
 
         let mut peers = self.peers.lock().await;
+        let other_objects: usize = peers
+            .values()
+            .filter(|peer| peer.address != peer_address)
+            .map(|peer| peer.inventory.len())
+            .sum();
+        if other_objects.saturating_add(objects.len()) > self.config.max_inventory_objects_total {
+            bail!("global inventory object cap exceeded");
+        }
         if let Some(peer) = peers.get_mut(&peer_address) {
             peer.inventory = objects;
             peer.inventory_synced = true;
@@ -790,14 +857,12 @@ impl Node {
             }
         }
         if inventory == self.store.inventory_digest() {
-            let local = self.store.inventory();
+            let local_count = self.store.file_count() + self.store.dir_count();
             let mut peers = self.peers.lock().await;
             if let Some(peer) = peers.get_mut(&address) {
-                peer.inventory = local
-                    .into_iter()
-                    .map(|object| (object.root(), object))
-                    .collect();
+                peer.inventory.clear();
                 peer.inventory_synced = true;
+                peer.objects = local_count as u32;
             }
             return;
         }
@@ -819,11 +884,12 @@ impl Node {
         } else {
             self.transport.find_in_link(&link_id).await
         }?;
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(SESSION_INCOMING_QUEUE);
         let session = Arc::new(LinkSession::new(
             link_id,
             link,
             self.transport.clone(),
+            self.memory_budget.clone(),
             outbound,
             tx,
         ));
@@ -874,6 +940,12 @@ impl Node {
             let peer_address = desc.address_hash;
             self.link_peers.lock().await.insert(link_id, peer_address);
             let mut peers = self.peers.lock().await;
+            if !ensure_peer_slot(&mut peers, peer_address, self.config.max_known_peers) {
+                drop(peers);
+                warn!("closing outbound link {link_id}: known peer cap reached");
+                self.close_session(&session).await;
+                return;
+            }
             let peer = peers
                 .entry(peer_address)
                 .or_insert_with(|| PeerState::new(peer_address));
@@ -937,6 +1009,7 @@ impl Node {
                 peer.link = None;
                 peer.verified = false;
                 peer.inventory_synced = false;
+                peer.inventory.clear();
             }
         }
         debug!("link {link_id} closed");
@@ -1082,6 +1155,15 @@ impl Node {
 
         {
             let mut peers = self.peers.lock().await;
+            if !ensure_peer_slot(&mut peers, peer_dest, self.config.max_known_peers) {
+                drop(peers);
+                warn!(
+                    "closing verified link {}: known peer cap reached",
+                    session.link_id
+                );
+                self.close_session(session).await;
+                return;
+            }
             let peer = peers
                 .entry(peer_dest)
                 .or_insert_with(|| PeerState::new(peer_dest));
@@ -2070,6 +2152,10 @@ impl Node {
             peers_connected,
             links,
             outbound_links,
+            inbound_buffer_bytes: self.memory_budget.used(),
+            inbound_buffer_limit: self.memory_budget.limit(),
+            known_peer_limit: self.config.max_known_peers,
+            inventory_object_limit: self.config.max_inventory_objects,
             transport_node: self.config.transport_node,
             connect: self.config.interfaces.connect.clone(),
             listen: self.config.interfaces.listen.clone(),
@@ -2175,7 +2261,13 @@ async fn reconnect_loop(node: Arc<Node>) {
     loop {
         tokio::time::sleep(Duration::from_secs(15)).await;
         let candidates: Vec<AddressHash> = {
-            let peers = node.peers.lock().await;
+            let mut peers = node.peers.lock().await;
+            let before = peers.len();
+            peers
+                .retain(|_, peer| peer.link.is_some() || peer.last_seen.elapsed() < PEER_RETENTION);
+            if peers.len() != before {
+                debug!("evicted {} stale peer record(s)", before - peers.len());
+            }
             peers
                 .values()
                 .filter(|peer| peer.desc.is_some() && peer.link.is_none())
@@ -2185,11 +2277,20 @@ async fn reconnect_loop(node: Arc<Node>) {
         for address in candidates {
             node.ensure_link(address).await;
         }
-        // Remove stale connection attempts.
+        // Remove stale connection attempts and link-to-peer mappings for
+        // pending links that never activated.
         node.connecting
             .lock()
             .await
             .retain(|_, started| started.elapsed() < Duration::from_secs(120));
+        let active_links: HashSet<LinkId> = {
+            let sessions = node.sessions.lock().await;
+            sessions.keys().copied().collect()
+        };
+        node.link_peers
+            .lock()
+            .await
+            .retain(|link_id, _| active_links.contains(link_id));
     }
 }
 

@@ -82,7 +82,7 @@ The payload is kept under 280 bytes; the name is dropped if necessary. The inven
 
 Both nodes may initiate simultaneously. Each side keeps the **lexicographically smaller link id** and closes the other. This converges without a coordinator. The kept link is the only one used for inventory and transfers.
 
-Links are bounded by `max_peers` (outbound) and `max_links` (total). Reticulum handles path discovery, multi-hop routing, encryption, and link keepalives.
+Links are bounded by `max_peers` (outbound and pending), `max_links` (total), and `max_known_peers` (retained peer records). Stale disconnected peers are evicted after one hour. Reticulum handles path discovery, multi-hop routing, encryption, and link keepalives.
 
 ## Content model
 
@@ -201,6 +201,7 @@ Receiver behavior:
 - clamp message size so the ACK bitmap fits in one link packet
 - enforce the same 4 MiB message cap on receive as on send
 - cap total in-progress receive bytes per link at 4 MiB
+- cap total in-progress receive bytes across all links with a shared 64 MiB budget (configurable), including frame-slot overhead
 - expire stale reassemblies and bound the number of concurrent reassemblies
 - **before identity verification, accept only bounded control messages** — normally the single-frame `Hello`. Chunk frames, non-Hello control messages, oversized messages, and more than two reassemblies are dropped. Peer state is created only after the handshake authenticates the destination/identity.
 - cap the signalled link MTU at 4 KiB, since an inbound peer controls the MTU in its link request and could otherwise force oversized decrypt/reassembly buffers
@@ -359,7 +360,7 @@ A directory's own name lives in its parent, matching the useful part of IPFS's m
 
 ### Inventory digest gating
 
-Full inventory exchange is O(objects). A 32-byte digest on announce/hello/change reduces steady-state traffic to near zero for unchanged peers. When the digest matches, peers assume identical inventories without transferring pages.
+Full inventory exchange is O(objects). A 32-byte digest on announce/hello/change reduces steady-state traffic to near zero for unchanged peers. When the digest matches, peers assume identical inventories without transferring pages. Inventory pages are capped at 64 entries, per-peer inventories at `max_inventory_objects`, and all peer inventories together at `max_inventory_objects_total`. A peer that exceeds a cap is not fully synchronized, and disconnected peers' inventory maps are dropped.
 
 ### Conservative Reticulum MTU by default
 

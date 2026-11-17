@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -57,6 +57,78 @@ const MAX_PRE_VERIFY_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_PRE_VERIFY_FRAMES: usize = 64;
 /// Total in-progress receive bytes per link, across all reassemblies.
 const MAX_INBOUND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Estimated heap cost of one empty frame slot in a reassembly vector.
+const REASSEMBLY_FRAME_SLOT_BYTES: usize = std::mem::size_of::<Option<Vec<u8>>>() + 8;
+/// Maximum size of an unsolicited/request control message queued for the node.
+const MAX_QUEUED_CONTROL_BYTES: usize = 64 * 1024;
+
+/// Shared process-wide budget for inbound reassembly memory.  The budget
+/// covers frame-slot allocations and payload copies, so many links cannot
+/// collectively exceed the configured limit.
+pub struct MemoryBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl MemoryBudget {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    pub fn try_reserve(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.limit {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PeerHello {
@@ -113,6 +185,14 @@ struct Reassembly {
     bitmap: Vec<u8>,
     last_ack: Instant,
     last_progress: Instant,
+    budget: Arc<MemoryBudget>,
+    reserved: usize,
+}
+
+impl Drop for Reassembly {
+    fn drop(&mut self) {
+        self.budget.release(self.reserved);
+    }
 }
 
 #[derive(Default)]
@@ -144,6 +224,7 @@ pub struct LinkSession {
     pub link: Arc<Mutex<Link>>,
     pub outbound: bool,
     transport: Transport,
+    memory_budget: Arc<MemoryBudget>,
     next_msg_id: AtomicU32,
     send_lock: Mutex<()>,
     outgoing: Mutex<HashMap<u32, Arc<Mutex<SendState>>>>,
@@ -167,6 +248,7 @@ impl LinkSession {
         link_id: LinkId,
         link: Arc<Mutex<Link>>,
         transport: Transport,
+        memory_budget: Arc<MemoryBudget>,
         outbound: bool,
         incoming_tx: mpsc::Sender<Incoming>,
     ) -> Self {
@@ -175,6 +257,7 @@ impl LinkSession {
             link,
             outbound,
             transport,
+            memory_budget,
             next_msg_id: AtomicU32::new(1),
             send_lock: Mutex::new(()),
             outgoing: Mutex::new(HashMap::new()),
@@ -237,6 +320,7 @@ impl LinkSession {
     pub async fn mark_closed(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.pending.lock().await.clear();
+        self.incoming_msgs.lock().await.clear();
         self.ack_notify.notify_waiters();
     }
 
@@ -466,12 +550,13 @@ impl LinkSession {
             }
 
             let buffered: usize = messages.values().map(|entry| entry.bytes).sum();
+            let is_new = !messages.contains_key(&frame.msg_id);
             let duplicate = messages
                 .get(&frame.msg_id)
                 .map(|entry| entry.frames[frame.seq as usize].is_some())
                 .unwrap_or(false);
-            if !duplicate && buffered.saturating_add(frame.payload.len()) > MAX_INBOUND_BUFFER_BYTES
-            {
+            let payload_len = frame.payload.len();
+            if !duplicate && buffered.saturating_add(payload_len) > MAX_INBOUND_BUFFER_BYTES {
                 debug!(
                     "dropping frame on {}: inbound reassembly buffer limit reached",
                     self.link_id
@@ -479,23 +564,50 @@ impl LinkSession {
                 return Ok(());
             }
 
-            let entry = messages.entry(frame.msg_id).or_insert_with(|| Reassembly {
-                kind: frame.kind,
-                total: frame.total,
-                frames: vec![None; frame.total as usize],
-                received: 0,
-                bytes: 0,
-                bytes_since_ack: 0,
-                bitmap: vec![0u8; ack_bitmap_len(frame.total)],
-                last_ack: Instant::now(),
-                last_progress: Instant::now(),
-            });
+            let slot_cost = if is_new {
+                (frame.total as usize).saturating_mul(REASSEMBLY_FRAME_SLOT_BYTES)
+            } else {
+                0
+            };
+            let payload_cost = if duplicate { 0 } else { payload_len };
+            let total_cost = slot_cost.saturating_add(payload_cost);
+            if !self.memory_budget.try_reserve(total_cost) {
+                debug!(
+                    "dropping frame on {}: global inbound memory budget exhausted",
+                    self.link_id
+                );
+                return Ok(());
+            }
+
+            if is_new {
+                messages.insert(
+                    frame.msg_id,
+                    Reassembly {
+                        kind: frame.kind,
+                        total: frame.total,
+                        frames: vec![None; frame.total as usize],
+                        received: 0,
+                        bytes: 0,
+                        bytes_since_ack: 0,
+                        bitmap: vec![0u8; ack_bitmap_len(frame.total)],
+                        last_ack: Instant::now(),
+                        last_progress: Instant::now(),
+                        budget: self.memory_budget.clone(),
+                        reserved: slot_cost,
+                    },
+                );
+            }
+            let Some(entry) = messages.get_mut(&frame.msg_id) else {
+                self.memory_budget.release(total_cost);
+                return Ok(());
+            };
             let index = frame.seq as usize;
             let duplicate = entry.frames[index].is_some();
             if !duplicate {
                 entry.frames[index] = Some(frame.payload.to_vec());
                 entry.received += 1;
-                entry.bytes = entry.bytes.saturating_add(frame.payload.len());
+                entry.bytes = entry.bytes.saturating_add(payload_len);
+                entry.reserved = entry.reserved.saturating_add(payload_cost);
                 entry.last_progress = Instant::now();
                 bitmap_set(&mut entry.bitmap, frame.seq);
             }
@@ -527,7 +639,7 @@ impl LinkSession {
 
         if complete {
             let finished = self.incoming_msgs.lock().await.remove(&frame.msg_id);
-            let Some(finished) = finished else {
+            let Some(mut finished) = finished else {
                 return Ok(());
             };
             if finished.received != finished.total as usize {
@@ -542,8 +654,9 @@ impl LinkSession {
             self.send_ack(frame.msg_id, finished.total, &final_bitmap)
                 .await;
 
+            let frames = std::mem::take(&mut finished.frames);
             let mut body = Vec::new();
-            for part in finished.frames {
+            for part in frames {
                 let Some(part) = part else {
                     return Ok(());
                 };
@@ -556,6 +669,7 @@ impl LinkSession {
     }
 
     async fn deliver_message(&self, kind: u8, _msg_id: u32, body: Vec<u8>) {
+        let body_len = body.len();
         let incoming = match kind {
             KIND_CONTROL => match ControlEnvelope::decode(&body) {
                 Ok(envelope) => Incoming::Control {
@@ -586,6 +700,10 @@ impl LinkSession {
             return;
         }
 
+        let (is_response, is_chunk) = match &incoming {
+            Incoming::Control { response, .. } => (*response, false),
+            Incoming::Chunk(_) => (true, true),
+        };
         let correlation = match &incoming {
             Incoming::Control {
                 request, response, ..
@@ -598,6 +716,27 @@ impl LinkSession {
                 let _ = sender.send(incoming);
                 return;
             }
+        }
+        // Chunks are only valid as responses and unmatched responses cannot be
+        // acted on.  Drop them instead of letting a peer fill the node queue.
+        if is_chunk || is_response {
+            debug!(
+                "dropping unmatched {} on {}",
+                if is_chunk {
+                    "chunk"
+                } else {
+                    "control response"
+                },
+                self.link_id
+            );
+            return;
+        }
+        if body_len > MAX_QUEUED_CONTROL_BYTES {
+            debug!(
+                "dropping oversized queued control message ({} bytes) on {}",
+                body_len, self.link_id
+            );
+            return;
         }
         if let Err(err) = self.incoming_tx.try_send(incoming) {
             warn!("dropping inbound message: {err}");
@@ -1082,5 +1221,34 @@ mod security_tests {
     fn zero_length_metadata_is_rejected() {
         assert!(!inbound_message_allowed(true, KIND_CONTROL, 0, 413, 431));
         assert!(!inbound_message_allowed(false, KIND_CONTROL, 1, 0, 500));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn memory_budget_enforces_global_limit() {
+        let budget = MemoryBudget::new(10);
+        assert!(budget.try_reserve(6));
+        assert_eq!(budget.used(), 6);
+        assert!(!budget.try_reserve(5));
+        assert!(budget.try_reserve(4));
+        assert_eq!(budget.used(), 10);
+        assert!(!budget.try_reserve(1));
+        budget.release(4);
+        assert_eq!(budget.used(), 6);
+        budget.release(100);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn memory_budget_rejects_overflow() {
+        let budget = MemoryBudget::new(usize::MAX);
+        assert!(budget.try_reserve(usize::MAX));
+        assert!(!budget.try_reserve(1));
+        budget.release(usize::MAX);
+        assert_eq!(budget.used(), 0);
     }
 }
