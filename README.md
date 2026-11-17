@@ -218,7 +218,7 @@ Relative paths in the configuration are resolved against the configuration file'
 
 This build configures Reticulum **TCP client/server** interfaces. Point `connect` at a Reticulum transport/router that carries LoRa, packet radio, serial, or other interfaces; MeshVault then participates in that wider mesh without needing direct radio hardware.
 
-`link_mtu_discovery` is off by default. Reticulum's interoperable packet MTU is 500 bytes; some SDK/interface combinations do not reliably carry larger link packets. Leave it off unless every peer is known to support a larger link MTU.
+`link_mtu_discovery` is off by default. Reticulum's interoperable packet MTU is 500 bytes; some SDK/interface combinations do not reliably carry larger link packets. Leave it off unless every peer is known to support a larger link MTU. Independently, MeshVault rejects inbound links whose signalled MTU exceeds 4 KiB, since the initiator controls that value.
 
 ## Storage
 

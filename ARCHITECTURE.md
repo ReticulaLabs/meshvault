@@ -77,7 +77,8 @@ The payload is kept under 280 bytes; the name is dropped if necessary. The inven
 6. The initiator calls Reticulum `link_identify` with its node identity.
 7. The responder verifies that the initiator's identity derives the destination hash claimed in `Hello`.
 8. The initiator verifies `Hello` against the destination identity it learned from the announce.
-9. On success, the peer is marked verified and inventory sync begins.
+9. On success, the peer destination/identity is bound immutably to the session, peer state is created only then, and inventory sync begins.
+10. A later `Hello` on the same link is ignored if identical and closes the link if it claims a different destination/identity. Inventory attribution always uses the bound destination, never mutable Hello state.
 
 Both nodes may initiate simultaneously. Each side keeps the **lexicographically smaller link id** and closes the other. This converges without a coordinator. The kept link is the only one used for inventory and transfers.
 
@@ -196,7 +197,13 @@ Receiver behavior:
 
 - ACK immediately on `BURST_END`, on completion, on duplicate frames (rate-limited), and periodically for very large messages
 - clamp message size so the ACK bitmap fits in one link packet
+- enforce the same 4 MiB message cap on receive as on send
+- cap total in-progress receive bytes per link at 4 MiB
 - expire stale reassemblies and bound the number of concurrent reassemblies
+- **before identity verification, accept only bounded control messages** — normally the single-frame `Hello`. Chunk frames, non-Hello control messages, oversized messages, and more than two reassemblies are dropped. Peer state is created only after the handshake authenticates the destination/identity.
+- cap the signalled link MTU at 4 KiB, since an inbound peer controls the MTU in its link request and could otherwise force oversized decrypt/reassembly buffers
+
+Pre-verification frames are further limited to 64 frames and 16 KiB, and ACKs are sent only for completed pre-verification messages, not for attacker-controlled partial bursts.
 
 The ACK bitmap means retransmission is selective: only missing frames are resent. One ACK is typically a few bytes; for a 1 MiB chunk at 431-byte payloads, the sender sends ~2,500 frames and the final bitmap is only ~313 bytes.
 
@@ -353,6 +360,8 @@ Full inventory exchange is O(objects). A 32-byte digest on announce/hello/change
 ### Conservative Reticulum MTU by default
 
 Larger Reticulum link packets can improve TCP throughput, but are not reliable across every current interface/version combination. The default is the interoperable 500-byte MTU. `link_mtu_discovery = true` opts in on controlled all-modern meshes.
+
+Independently of that option, inbound links are rejected if their signalled MTU exceeds 4 KiB. The initiator controls the MTU in a Reticulum link request, so trusting an unbounded value would let a peer force large SDK decrypt buffers and bypass footprint limits.
 
 ## Failure handling
 

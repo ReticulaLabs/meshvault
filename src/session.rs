@@ -34,7 +34,25 @@ const ACK_INTERVAL: Duration = Duration::from_millis(100);
 const SEND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_FRAME_ATTEMPTS: u8 = 12;
 const MAX_REASSEMBLY_AGE: Duration = Duration::from_secs(120);
-const MAX_REASSEMBLIES: usize = 64;
+
+/// Conservative maximum link MTU.  The initiator controls the MTU signalled in
+/// a Reticulum link request, so never let an inbound peer select an arbitrarily
+/// large link/decrypt buffer or an unbounded frame count.
+pub const MAX_LINK_MTU: usize = 4096;
+
+/// Verified links normally have one message in flight, but allow a few
+/// reassemblies for reordering/retransmission.
+const MAX_REASSEMBLIES: usize = 4;
+/// Before identity verification only a Hello is expected.  A second slot
+/// absorbs a retransmitted Hello without allowing an attacker to accumulate
+/// reassembly state.
+const MAX_PRE_VERIFY_REASSEMBLIES: usize = 2;
+/// Maximum encoded size of a pre-verification control message.
+const MAX_PRE_VERIFY_MESSAGE_BYTES: usize = 16 * 1024;
+/// Maximum frame count before verification, independent of link MTU.
+const MAX_PRE_VERIFY_FRAMES: usize = 64;
+/// Total in-progress receive bytes per link, across all reassemblies.
+const MAX_INBOUND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct PeerHello {
@@ -83,6 +101,7 @@ struct Reassembly {
     total: u16,
     frames: Vec<Option<Vec<u8>>>,
     received: usize,
+    bytes: usize,
     bitmap: Vec<u8>,
     last_ack: Instant,
     last_progress: Instant,
@@ -128,6 +147,9 @@ pub struct LinkSession {
     initial: OnceCell<InitialParams>,
     closed: AtomicBool,
     hello: RwLock<Option<PeerHello>>,
+    /// Peer destination bound once during verification.  All peer/inventory
+    /// attribution uses this value, never a later Hello.
+    verified_peer: RwLock<Option<LinkId>>,
     remote_identity: RwLock<Option<Identity>>,
     verified: AtomicBool,
 }
@@ -156,6 +178,7 @@ impl LinkSession {
             initial: OnceCell::new(),
             closed: AtomicBool::new(false),
             hello: RwLock::new(None),
+            verified_peer: RwLock::new(None),
             remote_identity: RwLock::new(None),
             verified: AtomicBool::new(false),
         }
@@ -171,6 +194,19 @@ impl LinkSession {
 
     pub fn mark_verified(&self) {
         self.verified.store(true, Ordering::Relaxed);
+    }
+
+    /// Bind the authenticated peer destination to this session.  The binding is
+    /// immutable for the lifetime of the link.
+    pub async fn bind_verified_peer(&self, peer: LinkId) {
+        let mut binding = self.verified_peer.write().await;
+        if binding.is_none() {
+            *binding = Some(peer);
+        }
+    }
+
+    pub async fn verified_peer(&self) -> Option<LinkId> {
+        *self.verified_peer.read().await
     }
 
     pub async fn set_hello(&self, hello: PeerHello) {
@@ -198,10 +234,13 @@ impl LinkSession {
 
     /// Effective transfer parameters for this link.
     pub async fn budget(&self) -> Result<LinkBudget> {
-        let (mdu, rtt) = {
+        let (mdu, rtt, mtu) = {
             let link = self.link.lock().await;
-            (link.mdu(), *link.rtt())
+            (link.mdu(), *link.rtt(), link.mtu())
         };
+        if mtu > MAX_LINK_MTU {
+            bail!("link MTU {mtu} exceeds the {MAX_LINK_MTU}-byte safety limit");
+        }
         if mdu <= crate::wire::HEADER_LEN + 1 {
             bail!("link MDU too small");
         }
@@ -380,51 +419,97 @@ impl LinkSession {
             bail!("frame sequence out of range");
         }
         let budget = self.budget().await?;
-        let max_frames = max_frames_per_message(budget.mdu);
-        if frame.total as usize > max_frames {
-            bail!("message advertises too many frames for this link");
+        let verified = self.is_verified();
+        let frame_capacity = budget
+            .mdu
+            .checked_sub(crate::wire::HEADER_LEN)
+            .filter(|capacity| *capacity > 0)
+            .context("link MDU too small")?;
+        if !inbound_message_allowed(
+            verified,
+            frame.kind,
+            frame.total,
+            frame_capacity,
+            budget.mdu,
+        ) {
+            debug!(
+                "dropping oversized/pre-verification frame on {} (kind={} total={} mdu={})",
+                self.link_id, frame.kind, frame.total, budget.mdu
+            );
+            return Ok(());
         }
 
+        let mut ack = None;
         let complete = {
             let mut messages = self.incoming_msgs.lock().await;
-            prune_reassemblies(&mut messages);
+            let max_reassemblies = if verified {
+                MAX_REASSEMBLIES
+            } else {
+                MAX_PRE_VERIFY_REASSEMBLIES
+            };
+            prune_reassemblies(&mut messages, max_reassemblies);
+
+            if let Some(entry) = messages.get(&frame.msg_id)
+                && (entry.total != frame.total || entry.kind != frame.kind)
+            {
+                // Never let a peer mutate a message's shape mid-reassembly.
+                messages.remove(&frame.msg_id);
+                bail!("inconsistent message metadata");
+            }
+
+            let buffered: usize = messages.values().map(|entry| entry.bytes).sum();
+            let duplicate = messages
+                .get(&frame.msg_id)
+                .map(|entry| entry.frames[frame.seq as usize].is_some())
+                .unwrap_or(false);
+            if !duplicate && buffered.saturating_add(frame.payload.len()) > MAX_INBOUND_BUFFER_BYTES
+            {
+                debug!(
+                    "dropping frame on {}: inbound reassembly buffer limit reached",
+                    self.link_id
+                );
+                return Ok(());
+            }
 
             let entry = messages.entry(frame.msg_id).or_insert_with(|| Reassembly {
                 kind: frame.kind,
                 total: frame.total,
                 frames: vec![None; frame.total as usize],
                 received: 0,
+                bytes: 0,
                 bitmap: vec![0u8; ack_bitmap_len(frame.total)],
                 last_ack: Instant::now(),
                 last_progress: Instant::now(),
             });
-            if entry.total != frame.total || entry.kind != frame.kind {
-                bail!("inconsistent message metadata");
-            }
             let index = frame.seq as usize;
             let duplicate = entry.frames[index].is_some();
             if !duplicate {
                 entry.frames[index] = Some(frame.payload.to_vec());
                 entry.received += 1;
+                entry.bytes = entry.bytes.saturating_add(frame.payload.len());
                 entry.last_progress = Instant::now();
                 bitmap_set(&mut entry.bitmap, frame.seq);
             }
             let complete = entry.received == entry.total as usize;
+
+            // Before verification, ACK only completed messages (normally the
+            // single-frame Hello).  This prevents a pre-handshake peer from
+            // using burst-end flags to turn tiny frames into a stream of ACKs.
             let due = complete
-                || frame.flags & FLAG_BURST_END != 0
-                || (duplicate && entry.last_ack.elapsed() >= ACK_INTERVAL)
-                || entry.received % 128 == 0;
-            let ack = if due {
+                || (verified
+                    && (frame.flags & FLAG_BURST_END != 0
+                        || (duplicate && entry.last_ack.elapsed() >= ACK_INTERVAL)
+                        || entry.received % 128 == 0));
+            if due {
                 entry.last_ack = Instant::now();
-                Some((entry.total, entry.bitmap.clone()))
-            } else {
-                None
-            };
-            if let Some((total, bitmap)) = ack {
-                self.send_ack(frame.msg_id, total, &bitmap).await;
+                ack = Some((entry.total, entry.bitmap.clone()));
             }
             complete
         };
+
+        if let Some((total, bitmap)) = ack {
+            self.send_ack(frame.msg_id, total, &bitmap).await;
+        }
 
         if complete {
             let finished = self.incoming_msgs.lock().await.remove(&frame.msg_id);
@@ -478,6 +563,14 @@ impl LinkSession {
             },
             _ => return,
         };
+
+        if !self.is_verified() && !pre_verification_message_allowed(&incoming) {
+            debug!(
+                "dropping non-Hello message received before link verification on {}",
+                self.link_id
+            );
+            return;
+        }
 
         let correlation = match &incoming {
             Incoming::Control {
@@ -765,19 +858,130 @@ fn mark_burst_end(frame: &mut [u8]) {
     }
 }
 
-fn prune_reassemblies(messages: &mut HashMap<u32, Reassembly>) {
-    if messages.len() < MAX_REASSEMBLIES {
-        return;
+fn pre_verification_message_allowed(incoming: &Incoming) -> bool {
+    matches!(
+        incoming,
+        Incoming::Control {
+            response: false,
+            body: Control::Hello { .. },
+            ..
+        }
+    )
+}
+
+fn inbound_message_allowed(
+    verified: bool,
+    kind: u8,
+    total: u16,
+    frame_capacity: usize,
+    mdu: usize,
+) -> bool {
+    if total == 0 || frame_capacity == 0 {
+        return false;
     }
+    let Some(declared_max) = (total as usize).checked_mul(frame_capacity) else {
+        return false;
+    };
+    if !verified {
+        if kind != KIND_CONTROL || total as usize > MAX_PRE_VERIFY_FRAMES {
+            return false;
+        }
+        return declared_max <= MAX_PRE_VERIFY_MESSAGE_BYTES;
+    }
+    declared_max <= max_message_bytes_for_mdu(mdu)
+}
+
+fn prune_reassemblies(messages: &mut HashMap<u32, Reassembly>, max_reassemblies: usize) {
     messages.retain(|_, entry| entry.last_progress.elapsed() < MAX_REASSEMBLY_AGE);
-    if messages.len() < MAX_REASSEMBLIES {
-        return;
-    }
-    if let Some(oldest) = messages
-        .iter()
-        .min_by_key(|(_, entry)| entry.last_progress)
-        .map(|(id, _)| *id)
-    {
+    while messages.len() >= max_reassemblies {
+        let Some(oldest) = messages
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_progress)
+            .map(|(id, _)| *id)
+        else {
+            break;
+        };
         messages.remove(&oldest);
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn pre_verification_accepts_only_small_control_messages() {
+        let mdu = crate::wire::HEADER_LEN + 413;
+        assert!(inbound_message_allowed(false, KIND_CONTROL, 1, 413, mdu));
+        assert!(inbound_message_allowed(false, KIND_CONTROL, 39, 413, mdu));
+        assert!(!inbound_message_allowed(false, KIND_CONTROL, 40, 413, mdu));
+        assert!(!inbound_message_allowed(false, KIND_CONTROL, 65, 1, mdu));
+        assert!(!inbound_message_allowed(false, KIND_CHUNK, 1, 413, mdu));
+        assert!(!inbound_message_allowed(false, KIND_ACK, 1, 413, mdu));
+    }
+
+    #[test]
+    fn verified_messages_are_capped_at_receive_side() {
+        let mdu = crate::wire::HEADER_LEN + 413;
+        assert!(inbound_message_allowed(true, KIND_CHUNK, 3304, 413, mdu));
+        assert!(!inbound_message_allowed(true, KIND_CHUNK, 3305, 413, mdu));
+
+        // A peer cannot use a huge signalled MTU to declare an enormous
+        // message: the receiver cap is still MAX_MESSAGE_BYTES.
+        assert!(!inbound_message_allowed(
+            true,
+            KIND_CHUNK,
+            u16::MAX,
+            2 * 1024 * 1024,
+            2 * 1024 * 1024 + crate::wire::HEADER_LEN
+        ));
+    }
+
+    #[test]
+    fn only_hello_is_delivered_before_verification() {
+        let hello = Incoming::Control {
+            request: 0,
+            response: false,
+            body: Control::Hello {
+                version: crate::wire::PROTOCOL_VERSION,
+                dest: "00000000000000000000000000000000".into(),
+                identity: "00000000000000000000000000000000".into(),
+                name: None,
+                objects: 0,
+                inventory: ContentHash::of(b"inventory"),
+            },
+        };
+        assert!(pre_verification_message_allowed(&hello));
+
+        let request = Incoming::Control {
+            request: 1,
+            response: false,
+            body: Control::GetChunk {
+                root: ContentHash::of(b"file"),
+                start: 0,
+                count: 1,
+            },
+        };
+        assert!(!pre_verification_message_allowed(&request));
+
+        let response = Incoming::Control {
+            request: 1,
+            response: true,
+            body: Control::Hello {
+                version: crate::wire::PROTOCOL_VERSION,
+                dest: "00000000000000000000000000000000".into(),
+                identity: "00000000000000000000000000000000".into(),
+                name: None,
+                objects: 0,
+                inventory: ContentHash::of(b"inventory"),
+            },
+        };
+        assert!(!pre_verification_message_allowed(&response));
+    }
+
+    #[test]
+    fn zero_length_metadata_is_rejected() {
+        assert!(!inbound_message_allowed(true, KIND_CONTROL, 0, 413, 431));
+        assert!(!inbound_message_allowed(false, KIND_CONTROL, 1, 0, 500));
     }
 }

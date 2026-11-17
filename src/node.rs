@@ -24,7 +24,7 @@ use crate::config::{Config, Paths};
 use crate::fetch::PieceProgress;
 use crate::hash::ContentHash;
 use crate::manifest::{DirEntry, DirManifest, DirSummary, Manifest, ObjectKind, ObjectSummary};
-use crate::session::{Incoming, LinkSession, PeerHello};
+use crate::session::{Incoming, LinkSession, MAX_LINK_MTU, PeerHello};
 use crate::store::{MAX_PIECES_PER_REQUEST, Store, sanitize_name};
 use crate::wire::{
     CHUNK_HEADER_LEN, ChunkMessage, Control, INVENTORY_PAGE_SIZE, NodeAnnounce, PROTOCOL_VERSION,
@@ -665,8 +665,10 @@ impl Node {
         if !session.is_verified() {
             return Ok(());
         }
-        let hello = session.hello().await.context("peer hello missing")?;
-        let peer_address = AddressHash::new_from_hex_string(&hello.dest)?;
+        let peer_address = session
+            .verified_peer()
+            .await
+            .context("peer identity is not bound to the link")?;
         let local_inventory = self.store.inventory();
         let local_digest = self.store.inventory_digest();
         let expected_digest = {
@@ -763,16 +765,20 @@ impl Node {
         objects: u32,
         inventory: ContentHash,
     ) {
+        if !session.is_verified() {
+            debug!(
+                "ignoring inventory change on unverified link {}",
+                session.link_id
+            );
+            return;
+        }
         debug!(
             "peer inventory change on link {}: {} objects, digest {}",
             session.link_id,
             objects,
             inventory.short()
         );
-        let Some(hello) = session.hello().await else {
-            return;
-        };
-        let Ok(address) = AddressHash::new_from_hex_string(&hello.dest) else {
+        let Some(address) = session.verified_peer().await else {
             return;
         };
         {
@@ -843,7 +849,7 @@ impl Node {
             warn!("activated link {link_id} disappeared");
             return;
         };
-        {
+        let link_mtu = {
             let link = session.link.lock().await;
             debug!(
                 "link {} activated ({}): mtu={} mdu={}",
@@ -852,6 +858,12 @@ impl Node {
                 link.mtu(),
                 link.mdu()
             );
+            link.mtu()
+        };
+        if link_mtu > MAX_LINK_MTU {
+            warn!("closing link {link_id}: signalled MTU {link_mtu} exceeds {MAX_LINK_MTU}");
+            self.close_session(&session).await;
+            return;
         }
 
         if outbound {
@@ -931,6 +943,13 @@ impl Node {
     }
 
     async fn handle_hello(self: &Arc<Self>, session: &Arc<LinkSession>, hello: HelloPayload) {
+        if session.is_verified() {
+            debug!(
+                "ignoring repeated Hello on already-verified link {}",
+                session.link_id
+            );
+            return;
+        }
         let HelloPayload {
             version,
             dest,
@@ -939,19 +958,33 @@ impl Node {
             objects,
             inventory,
         } = hello;
+        if let Some(existing) = session.hello().await {
+            if existing.dest == dest && existing.identity == identity {
+                debug!(
+                    "ignoring duplicate Hello on unverified link {}",
+                    session.link_id
+                );
+            } else {
+                warn!(
+                    "peer changed identity in a second Hello on link {}; closing",
+                    session.link_id
+                );
+                self.close_session(session).await;
+            }
+            return;
+        }
         if version != PROTOCOL_VERSION {
             warn!("peer speaks protocol version {version}; closing link");
             self.close_session(session).await;
             return;
         }
-        let (Ok(peer_dest), Ok(identity_hash)) = (
-            AddressHash::new_from_hex_string(&dest),
-            AddressHash::new_from_hex_string(&identity),
-        ) else {
+        if AddressHash::new_from_hex_string(&dest).is_err()
+            || AddressHash::new_from_hex_string(&identity).is_err()
+        {
             warn!("peer sent invalid hello identifiers");
             self.close_session(session).await;
             return;
-        };
+        }
         let hello = PeerHello {
             dest,
             identity,
@@ -960,17 +993,8 @@ impl Node {
             inventory,
         };
         session.set_hello(hello).await;
-        {
-            let mut peers = self.peers.lock().await;
-            let peer = peers
-                .entry(peer_dest)
-                .or_insert_with(|| PeerState::new(peer_dest));
-            peer.name = clean_name(name);
-            peer.objects = objects;
-            peer.inventory_digest = Some(inventory);
-            peer.identity_hash = Some(identity_hash);
-            peer.last_seen = Instant::now();
-        }
+        // Peer state is created only after try_complete_handshake has
+        // authenticated the claimed destination/identity.
         self.try_complete_handshake(session).await;
     }
 
@@ -1023,6 +1047,7 @@ impl Node {
         };
 
         session.mark_verified();
+        session.bind_verified_peer(peer_dest).await;
         self.connecting.lock().await.remove(&peer_dest);
 
         let existing = {
@@ -1065,7 +1090,7 @@ impl Node {
             peer.identity_hash = Some(identity.address_hash);
             peer.link = Some(session.link_id);
             peer.verified = true;
-            peer.name = hello.name.clone();
+            peer.name = clean_name(hello.name.clone());
             peer.objects = hello.objects;
             peer.inventory_digest = Some(hello.inventory);
             peer.last_seen = Instant::now();
