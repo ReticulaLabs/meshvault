@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,51 @@ const ANNOUNCE_PAYLOAD_LIMIT: usize = 280;
 const MAX_DIRECTORY_DEPTH: usize = 64;
 const SESSION_INCOMING_QUEUE: usize = 32;
 const PEER_RETENTION: Duration = Duration::from_secs(60 * 60);
+
+/// Set when the local RPC client disconnects, aborting in-flight fetches.
+#[derive(Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, AtomicOrdering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(AtomicOrdering::Relaxed)
+    }
+}
+
+struct ExtractionBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+impl ExtractionBudget {
+    fn new(entries: usize, bytes: u64) -> Self {
+        Self { entries, bytes }
+    }
+
+    fn consume_entry(&mut self) -> Result<()> {
+        if self.entries == 0 {
+            bail!("directory extraction entry budget exhausted");
+        }
+        self.entries -= 1;
+        Ok(())
+    }
+
+    fn consume_bytes(&mut self, bytes: u64) -> Result<()> {
+        if bytes > self.bytes {
+            bail!("directory extraction byte budget exhausted");
+        }
+        self.bytes -= bytes;
+        Ok(())
+    }
+}
 
 pub fn destination_name() -> DestinationName {
     DestinationName::new("meshvault", "node")
@@ -509,7 +555,14 @@ impl Node {
     }
 
     /// List a local or remote directory.
-    pub async fn list_directory(self: &Arc<Self>, root: ContentHash) -> Result<DirListing> {
+    pub async fn list_directory(
+        self: &Arc<Self>,
+        root: ContentHash,
+        cancel: CancelToken,
+    ) -> Result<DirListing> {
+        if cancel.is_cancelled() {
+            bail!("operation cancelled");
+        }
         if let Ok(manifest) = self.store.read_dir_manifest(root) {
             let summary = self.store.dir_summary(root);
             return Ok(DirListing {
@@ -522,12 +575,13 @@ impl Node {
             .resolve_object(
                 root,
                 Duration::from_secs(self.config.fetch_wait_secs.max(5)),
+                &cancel,
             )
             .await?;
         let ObjectSummary::Directory(summary) = object else {
             bail!("{} is a file, not a directory", root.short());
         };
-        let manifest = self.get_dir_manifest(root, Some(&summary)).await?;
+        let manifest = self.get_dir_manifest(root, Some(&summary), &cancel).await?;
         Ok(DirListing {
             root,
             name: summary.name,
@@ -541,16 +595,21 @@ impl Node {
         self: &Arc<Self>,
         root: ContentHash,
         output: Option<PathBuf>,
+        cancel: CancelToken,
     ) -> Result<GetResult> {
+        if cancel.is_cancelled() {
+            bail!("operation cancelled");
+        }
         let object = self
             .resolve_object(
                 root,
                 Duration::from_secs(self.config.fetch_wait_secs.max(5)),
+                &cancel,
             )
             .await?;
         match object {
             ObjectSummary::File(_) => {
-                let result = self.fetch_file(root, output).await?;
+                let result = self.fetch_file(root, output, None, &cancel).await?;
                 Ok(GetResult {
                     object: result.object,
                     path: result.path,
@@ -561,21 +620,43 @@ impl Node {
                 let name =
                     sanitize_name(&summary.display_name()).unwrap_or_else(|| summary.root.short());
                 let target = match output {
-                    Some(path) if path.exists() && path.is_dir() => path.join(name),
-                    Some(path) => path,
+                    Some(path) => match fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            bail!("refusing symlink output path {}", path.display());
+                        }
+                        Ok(meta) if meta.is_dir() => path.join(name),
+                        Ok(_) => path,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => path,
+                        Err(err) => {
+                            return Err(err).with_context(|| format!("inspect {}", path.display()));
+                        }
+                    },
                     None => std::env::current_dir()?.join(name),
                 };
-                if target.exists() {
-                    if !target.is_dir() {
+                match fs::symlink_metadata(&target) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        bail!("refusing symlink extraction target {}", target.display());
+                    }
+                    Ok(meta) if meta.is_dir() => {
+                        let mut entries = fs::read_dir(&target)?;
+                        if entries.next().is_some() {
+                            bail!("{} already exists and is not empty", target.display());
+                        }
+                    }
+                    Ok(_) => {
                         bail!("{} already exists and is not a directory", target.display());
                     }
-                    let mut entries = fs::read_dir(&target)?;
-                    if entries.next().is_some() {
-                        bail!("{} already exists and is not empty", target.display());
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err).with_context(|| format!("inspect {}", target.display()));
                     }
                 }
+                let mut budget = ExtractionBudget::new(
+                    self.config.max_extract_entries,
+                    self.config.max_extract_bytes,
+                );
                 let mut stack = Vec::new();
-                self.fetch_dir_recursive(root, &target, &mut stack, 0)
+                self.fetch_dir_recursive(root, &target, &mut stack, 0, &mut budget, &cancel)
                     .await?;
                 Ok(GetResult {
                     object: ObjectSummary::Directory(summary.clone()),
@@ -1710,9 +1791,13 @@ impl Node {
         self: &Arc<Self>,
         root: ContentHash,
         wait: Duration,
+        cancel: &CancelToken,
     ) -> Result<ObjectSummary> {
         let deadline = Instant::now() + wait;
         loop {
+            if cancel.is_cancelled() {
+                bail!("operation cancelled");
+            }
             if let Some(object) = self.store.object_summary(root) {
                 return Ok(object);
             }
@@ -1848,11 +1933,20 @@ impl Node {
         self: &Arc<Self>,
         root: ContentHash,
         output: Option<PathBuf>,
+        mut budget: Option<&mut ExtractionBudget>,
+        cancel: &CancelToken,
     ) -> Result<FetchResult> {
+        if cancel.is_cancelled() {
+            bail!("operation cancelled");
+        }
         let lock = self.fetch_lock(root).await;
         let _guard = lock.lock().await;
 
         if self.store.has_file(root) {
+            let size = self.store.file_summary(root).map(|f| f.size).unwrap_or(0);
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.consume_bytes(size)?;
+            }
             let store = self.store.clone();
             let out = output.clone();
             let path = tokio::task::spawn_blocking(move || store.export(root, out.as_deref()))
@@ -1865,7 +1959,7 @@ impl Node {
             return Ok(FetchResult {
                 object,
                 path,
-                bytes: self.store.file_summary(root).map(|f| f.size).unwrap_or(0),
+                bytes: size,
                 resumed: true,
                 sources: Vec::new(),
             });
@@ -1884,8 +1978,27 @@ impl Node {
         let mut sources: HashSet<AddressHash> = HashSet::new();
         let mut empty_rounds = 0u32;
         let mut announced_sources = false;
+        let mut budget_charged = false;
+        let mut last_progress_at = Instant::now();
+        let mut last_verified_count = 0usize;
+        let stall_timeout = Duration::from_secs(self.config.fetch_stall_timeout_secs.max(60));
 
         loop {
+            if cancel.is_cancelled() {
+                bail!("operation cancelled");
+            }
+            if manifest.is_some() {
+                if let Some(progress) = &progress {
+                    let done = progress.lock().unwrap().verified_count();
+                    if done > last_verified_count {
+                        last_verified_count = done;
+                        last_progress_at = Instant::now();
+                    }
+                }
+                if last_progress_at.elapsed() > stall_timeout {
+                    bail!("fetch made no progress for {:?}", stall_timeout);
+                }
+            }
             let candidates = self.fetch_candidates(root, ObjectKind::File).await;
             if candidates.is_empty() {
                 self.trigger_inventory_syncs().await;
@@ -1925,6 +2038,15 @@ impl Node {
                             progress = Some(piece_progress);
                             manifest = Some(loaded);
                             manifest_hash = Some(hash);
+                            if !budget_charged {
+                                if let Some(budget) = budget.as_deref_mut() {
+                                    budget
+                                        .consume_bytes(manifest.as_ref().map_or(0, |m| m.size))?;
+                                }
+                                budget_charged = true;
+                            }
+                            last_progress_at = Instant::now();
+                            last_verified_count = initial_verified;
                             break;
                         }
                         Err(err) => {
@@ -2013,16 +2135,36 @@ impl Node {
                 let shared = shared.clone();
                 let partial = partial.clone();
                 let max_chunk_bytes = self.config.max_chunk_bytes;
+                let cancel = cancel.clone();
                 workers.spawn(async move {
                     let stats = node
-                        .fetch_file_worker(&session, root, &shared, &partial, max_chunk_bytes)
+                        .fetch_file_worker(
+                            &session,
+                            root,
+                            &shared,
+                            &partial,
+                            max_chunk_bytes,
+                            &cancel,
+                        )
                         .await;
                     (candidate.peer, stats)
                 });
                 spawned += 1;
             }
 
-            while let Some(joined) = workers.join_next().await {
+            loop {
+                if cancel.is_cancelled() {
+                    workers.abort_all();
+                    bail!("operation cancelled");
+                }
+                let joined =
+                    match tokio::time::timeout(Duration::from_millis(500), workers.join_next())
+                        .await
+                    {
+                        Ok(Some(joined)) => joined,
+                        Ok(None) => break,
+                        Err(_) => continue,
+                    };
                 match joined {
                     Ok((peer, Ok(stats))) => {
                         if stats.chunks > 0 {
@@ -2127,9 +2269,13 @@ impl Node {
         shared: &Arc<SharedFetch>,
         file: &Arc<std::fs::File>,
         max_chunk_bytes: u64,
+        cancel: &CancelToken,
     ) -> Result<WorkerStats> {
         let mut stats = WorkerStats::default();
         loop {
+            if cancel.is_cancelled() {
+                bail!("operation cancelled");
+            }
             let all_done = shared.progress.lock().unwrap().all_done();
             if all_done {
                 break;
@@ -2212,7 +2358,11 @@ impl Node {
         self: &Arc<Self>,
         root: ContentHash,
         summary: Option<&DirSummary>,
+        cancel: &CancelToken,
     ) -> Result<DirManifest> {
+        if cancel.is_cancelled() {
+            bail!("operation cancelled");
+        }
         if let Ok(manifest) = self.store.read_dir_manifest(root) {
             return Ok(manifest);
         }
@@ -2222,6 +2372,7 @@ impl Node {
                 .resolve_object(
                     root,
                     Duration::from_secs(self.config.fetch_wait_secs.max(5)),
+                    cancel,
                 )
                 .await?
             {
@@ -2232,6 +2383,9 @@ impl Node {
         let candidates = self.fetch_candidates(root, ObjectKind::Directory).await;
         let mut last_error: Option<anyhow::Error> = None;
         for candidate in candidates {
+            if cancel.is_cancelled() {
+                bail!("operation cancelled");
+            }
             let peer_address = candidate.peer;
             let Some(session) = self.session_for_link(candidate.link).await else {
                 continue;
@@ -2285,7 +2439,12 @@ impl Node {
         target: &Path,
         stack: &mut Vec<ContentHash>,
         depth: usize,
+        budget: &mut ExtractionBudget,
+        cancel: &CancelToken,
     ) -> Result<()> {
+        if cancel.is_cancelled() {
+            bail!("operation cancelled");
+        }
         if depth > MAX_DIRECTORY_DEPTH {
             bail!("directory nesting is too deep");
         }
@@ -2293,26 +2452,41 @@ impl Node {
             bail!("directory cycle detected at {}", root.short());
         }
         stack.push(root);
-        let manifest = self.get_dir_manifest(root, None).await?;
+        let manifest = self.get_dir_manifest(root, None, cancel).await?;
         fs::create_dir_all(target)
             .with_context(|| format!("create directory {}", target.display()))?;
 
         for entry in manifest.entries {
+            if cancel.is_cancelled() {
+                bail!("operation cancelled");
+            }
+            budget.consume_entry()?;
             let Some(name) = sanitize_name(&entry.name) else {
                 warn!("skipping unsafe directory entry name {:?}", entry.name);
                 continue;
             };
             let child = target.join(&name);
+            if fs::symlink_metadata(&child).is_ok() {
+                bail!(
+                    "refusing existing/symlink extraction path {}",
+                    child.display()
+                );
+            }
             match entry.kind {
                 ObjectKind::File => {
-                    if child.exists() {
-                        bail!("{} already exists", child.display());
-                    }
-                    self.fetch_file(entry.hash, Some(child)).await?;
+                    self.fetch_file(entry.hash, Some(child), Some(budget), cancel)
+                        .await?;
                 }
                 ObjectKind::Directory => {
-                    Box::pin(self.fetch_dir_recursive(entry.hash, &child, stack, depth + 1))
-                        .await?;
+                    Box::pin(self.fetch_dir_recursive(
+                        entry.hash,
+                        &child,
+                        stack,
+                        depth + 1,
+                        budget,
+                        cancel,
+                    ))
+                    .await?;
                 }
             }
         }
@@ -2623,6 +2797,27 @@ fn write_identity(path: &Path, identity: &PrivateIdentity) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extraction_budget_is_enforced() {
+        let mut budget = ExtractionBudget::new(2, 10);
+        budget.consume_entry().unwrap();
+        budget.consume_entry().unwrap();
+        assert!(budget.consume_entry().is_err());
+
+        budget.consume_bytes(6).unwrap();
+        assert!(budget.consume_bytes(5).is_err());
+        budget.consume_bytes(4).unwrap();
+        assert!(budget.consume_bytes(1).is_err());
+    }
+
+    #[test]
+    fn cancel_token_is_observable() {
+        let token = CancelToken::new();
+        assert!(!token.is_cancelled());
+        token.cancel();
+        assert!(token.is_cancelled());
+    }
 
     #[test]
     fn daemon_lock_is_exclusive_and_released_on_drop() {

@@ -38,12 +38,18 @@ pub struct Config {
     pub max_chunk_bytes: u64,
     /// How long `get` waits for a peer/inventory to show up.
     pub fetch_wait_secs: u64,
+    /// Abort a fetch after this long without verified progress.
+    pub fetch_stall_timeout_secs: u64,
     /// Maximum number of peers used in parallel for one file fetch.
     pub fetch_parallelism: usize,
     /// Maximum inventory entries accepted from one peer.
     pub max_inventory_objects: usize,
     /// Maximum inventory entries retained across all peers.
     pub max_inventory_objects_total: usize,
+    /// Maximum directory entries materialized by one recursive get.
+    pub max_extract_entries: usize,
+    /// Maximum file bytes materialized by one recursive get.
+    pub max_extract_bytes: u64,
     /// Process-wide budget for inbound reassembly buffers.
     pub max_inbound_memory_bytes: u64,
     /// Sustained per-peer service bandwidth (bytes/second).
@@ -88,9 +94,12 @@ impl Default for Config {
             piece_size: crate::manifest::DEFAULT_PIECE_SIZE,
             max_chunk_bytes: 1024 * 1024,
             fetch_wait_secs: 20,
+            fetch_stall_timeout_secs: 3600,
             fetch_parallelism: 4,
             max_inventory_objects: 16_384,
             max_inventory_objects_total: 65_536,
+            max_extract_entries: 100_000,
+            max_extract_bytes: 10 * 1024 * 1024 * 1024,
             max_inbound_memory_bytes: 64 * 1024 * 1024,
             peer_service_bytes_per_sec: 4 * 1024 * 1024,
             peer_service_burst_bytes: 8 * 1024 * 1024,
@@ -203,6 +212,12 @@ impl Config {
         if self.max_inventory_objects_total > 4_000_000 {
             bail!("max_inventory_objects_total is unreasonably large");
         }
+        if self.fetch_stall_timeout_secs < 60 {
+            bail!("fetch_stall_timeout_secs must be at least 60");
+        }
+        if self.max_extract_entries == 0 || self.max_extract_bytes == 0 {
+            bail!("max_extract_entries and max_extract_bytes must be positive");
+        }
         if !(4 * 1024 * 1024..=1024 * 1024 * 1024).contains(&self.max_inbound_memory_bytes) {
             bail!("max_inbound_memory_bytes must be between 4 MiB and 1 GiB");
         }
@@ -284,6 +299,10 @@ max_known_peers = 512
 max_inventory_objects = 16384
 max_inventory_objects_total = 65536
 
+# Recursive directory extraction limits (one `get` operation).
+max_extract_entries = 100000
+max_extract_bytes = 10737418240
+
 # Process-wide budget for inbound message reassembly. Individual links are
 # additionally capped at 4 MiB in flight.
 max_inbound_memory_bytes = 67108864
@@ -302,6 +321,9 @@ max_chunk_bytes = 1048576
 
 # How long `meshvault get` waits for a peer to advertise the requested hash.
 fetch_wait_secs = 20
+
+# Abort a fetch after this many seconds without verified progress.
+fetch_stall_timeout_secs = 3600
 
 # Fetch one file from up to this many peers in parallel.  Set to 1 to disable
 # multi-source fetching.

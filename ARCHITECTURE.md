@@ -301,24 +301,27 @@ Chunk bodies have a 44-byte header (request id, 32-byte root, start piece, piece
 2. Request the file manifest once from the best candidate (fewest hops, then best SNR).
 3. Verify the manifest hash against the inventory entry, then discard candidates whose advertised manifest hash differs.
 4. Verify which pieces already exist in `partial/<root>.part`; this becomes the initial shared bitmap.
-5. Start up to `fetch_parallelism` workers, one per peer. Each worker:
+5. A caller cancellation token aborts the fetch when the local RPC connection closes, and `fetch_stall_timeout_secs` aborts a fetch that makes no verified progress.
+6. Start up to `fetch_parallelism` workers, one per peer. Each worker:
    - asks its link for an adaptive chunk plan
    - atomically claims a disjoint contiguous range of missing pieces
    - requests that range and verifies every piece before writing any of them
    - writes pieces with positional `pwrite` calls into the shared partial file
    - marks the range verified and claims the next range
-6. A failed range is released back to the pool and retried with half as many pieces (up to three attempts on that peer). If the peer still fails, it enters a short cooldown and other workers continue.
-7. When every piece is verified, `fsync` the partial file, verify the full BLAKE3 root, atomically promote it to `blobs/`, write the manifest, cache/advertise if configured, and export to the output path.
+7. A failed range is released back to the pool and retried with half as many pieces (up to three attempts on that peer). If the peer still fails, it enters a short cooldown and other workers continue.
+8. When every piece is verified, `fsync` the partial file, verify the full BLAKE3 root, atomically promote it to `blobs/`, write the manifest, cache/advertise if configured, and export to the output path.
 
 Workers never overlap piece ranges, and verification-before-write prevents a corrupt chunk from leaving partial state in the shared progress bitmap. The partial file is opened once and shared; `write_at`/`pwrite` avoids seeks and cross-worker locking.
 
 ### Directory
 
 1. Fetch the directory manifest and verify its BLAKE3 directory hash.
-2. Materialize entries in sorted order.
-3. Files use the file fetch flow.
-4. Child directories recurse, with a depth limit and a stack-based cycle check.
-5. Unsafe entry names are rejected/skipped; output never escapes the target directory.
+2. Create a per-get extraction budget (`max_extract_entries`, `max_extract_bytes`).
+3. Consume one entry per listed child and the actual manifest size of every file before transfer.
+4. Materialize entries in sorted order.
+5. Files use the file fetch flow.
+6. Child directories recurse, with a depth limit and a stack-based cycle check.
+7. Unsafe entry names are rejected/skipped; symlink output paths and pre-existing/symlink child paths are refused; output never escapes the target directory.
 
 ## Storage design
 
@@ -389,6 +392,9 @@ Independently of that option, inbound links are rejected if their signalled MTU 
 | Inventory changes during pagination | Sync aborts and retries on the next announce/notification. |
 | Disk crash mid-import/fetch | Only `tmp/` staging is lost; existing objects remain valid. |
 | Crash after blob write before manifest | Orphan blob reported at startup; can be re-imported. |
+| RPC client disconnects during get/list | Cancellation token aborts the active operation; worker requests are aborted between joins. |
+| Fetch makes no verified progress | Aborts after `fetch_stall_timeout_secs`. |
+| Directory extraction exceeds entry/byte budget | Aborts before further file transfer or directory expansion. |
 | Second daemon on same repository | Exits immediately because `daemon.lock` is held. |
 | Concurrent CLI auto-start | Losing daemon exits; clients keep polling for the winner's RPC socket. |
 | Malicious directory cycle | Recursion stack detects and aborts. |

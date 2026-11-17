@@ -754,9 +754,9 @@ impl Store {
         if destination == blob {
             return Ok(destination);
         }
-        if destination.exists() {
+        if fs::symlink_metadata(&destination).is_ok() {
             bail!(
-                "refusing to overwrite existing file {}",
+                "refusing to overwrite existing file or symlink {}",
                 destination.display()
             );
         }
@@ -970,6 +970,25 @@ mod tests {
         assert!(manifest.verify_piece(0, &bad).is_err());
         bad.copy_from_slice(&fs::read(&source).unwrap());
         manifest.verify_piece(0, &bad).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_refuses_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = write_temp_file(temp.path(), "source.bin", 4096);
+        let store = Store::open(&temp.path().join("repo")).unwrap();
+        let manifest = store.import_file(&source, 4096, None).unwrap();
+
+        let victim = temp.path().join("victim.txt");
+        fs::write(&victim, b"do not overwrite").unwrap();
+        let link = temp.path().join("output.bin");
+        symlink(&victim, &link).unwrap();
+
+        assert!(store.export(manifest.root, Some(&link)).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"do not overwrite");
     }
 
     #[test]

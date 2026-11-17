@@ -23,7 +23,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::Paths;
 use crate::hash::ContentHash;
-use crate::node::Node;
+use crate::node::{CancelToken, Node};
 
 #[derive(Deserialize)]
 struct RpcRequest {
@@ -88,7 +88,16 @@ pub async fn serve(node: Arc<Node>, listener: UnixListener) -> Result<()> {
 async fn handle_connection(node: Arc<Node>, stream: UnixStream) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut pending_line: Option<String> = None;
+
+    loop {
+        let line = match pending_line.take() {
+            Some(line) => line,
+            None => match lines.next_line().await? {
+                Some(line) => line,
+                None => break,
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -108,7 +117,44 @@ async fn handle_connection(node: Arc<Node>, stream: UnixStream) -> Result<()> {
             }
         };
         let id = request.id;
-        let response = match dispatch(&node, &request.method, request.params).await {
+        let cancel = CancelToken::new();
+        let mut dispatch_fut = Box::pin(dispatch(
+            &node,
+            &request.method,
+            request.params,
+            cancel.clone(),
+        ));
+        let mut monitoring = true;
+        let result = loop {
+            tokio::select! {
+                result = &mut dispatch_fut => break result,
+                next = lines.next_line(), if monitoring => {
+                    match next {
+                        Ok(Some(next_line)) => {
+                            // The client pipelined a request.  Keep it for the
+                            // next iteration and stop reading until this
+                            // operation completes; only EOF/disconnect now
+                            // cancels the active operation.
+                            pending_line = Some(next_line);
+                            monitoring = false;
+                        }
+                        Ok(None) => {
+                            log::debug!("RPC client disconnected; cancelling active operation");
+                            cancel.cancel();
+                            let _ = dispatch_fut.await;
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            cancel.cancel();
+                            let _ = dispatch_fut.await;
+                            return Err(err).context("read RPC request");
+                        }
+                    }
+                }
+            }
+        };
+
+        let response = match result {
             Ok(result) => RpcResponse {
                 id,
                 result: Some(result),
@@ -128,7 +174,12 @@ async fn handle_connection(node: Arc<Node>, stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
-async fn dispatch(node: &Arc<Node>, method: &str, params: Value) -> Result<Value> {
+async fn dispatch(
+    node: &Arc<Node>,
+    method: &str,
+    params: Value,
+    cancel: CancelToken,
+) -> Result<Value> {
     match method {
         "ping" => Ok(json!("pong")),
         "status" => Ok(serde_json::to_value(node.status().await)?),
@@ -147,7 +198,7 @@ async fn dispatch(node: &Arc<Node>, method: &str, params: Value) -> Result<Value
             let hash = param_string(&params, "hash")?;
             let root = ContentHash::from_hex(&hash)?;
             let output = param_optional_string(&params, "output")?.map(PathBuf::from);
-            let result = node.get(root, output).await?;
+            let result = node.get(root, output, cancel).await?;
             Ok(serde_json::to_value(result)?)
         }
         "ls" | "list" => {
@@ -155,7 +206,7 @@ async fn dispatch(node: &Arc<Node>, method: &str, params: Value) -> Result<Value
             match hash {
                 Some(hash) => {
                     let root = ContentHash::from_hex(&hash)?;
-                    let listing = node.list_directory(root).await?;
+                    let listing = node.list_directory(root, cancel).await?;
                     Ok(serde_json::to_value(listing)?)
                 }
                 None => Ok(serde_json::to_value(node.list_local())?),

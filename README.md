@@ -202,10 +202,13 @@ max_known_peers = 512            # retained peer records
 piece_size = 16384               # hashing/verification piece size
 max_chunk_bytes = 1048576        # cap for one adaptive transfer message
 fetch_wait_secs = 20             # how long get waits for a peer/inventory
+fetch_stall_timeout_secs = 3600  # abort after this long without progress
 fetch_parallelism = 4            # parallel source peers per file (1 disables)
 max_inventory_objects = 16384    # inventory entries accepted per peer
 max_inventory_objects_total = 65536  # inventory entries across all peers
 max_inbound_memory_bytes = 67108864  # 64 MiB global reassembly budget
+max_extract_entries = 100000     # recursive get entry budget
+max_extract_bytes = 10737418240  # recursive get byte budget (10 GiB)
 peer_service_bytes_per_sec = 4194304  # per-peer serving rate (4 MiB/s)
 peer_service_burst_bytes = 8388608    # per-peer burst allowance (8 MiB)
 cache_fetched = true             # keep and advertise fetched content
@@ -271,6 +274,8 @@ The end-to-end development check runs daemons over Reticulum TCP, adds files/dir
 - Parallel sources must advertise the same manifest hash, which means the same piece size/layout. A peer that imported the file with a different `piece_size` is excluded from that fetch.
 - Peers with more than `max_inventory_objects` entries are not fully synchronized; raise that limit (and `max_inventory_objects_total`) for repositories with many files. Disconnected peers are evicted after one hour, and the retained peer table is capped by `max_known_peers`.
 - Inbound reassembly is bounded per link (4 MiB) and globally by `max_inbound_memory_bytes`; frames that would exceed the global budget are dropped and retried by the sender.
+- A fetch aborts after `fetch_stall_timeout_secs` without verified progress, and an RPC disconnect cancels its active operation.
+- Recursive directory extraction is bounded by `max_extract_entries` and `max_extract_bytes`, refuses symlink destinations, and does not follow pre-existing symlinks in extracted paths.
 - Each peer has a service token bucket (`peer_service_bytes_per_sec` / `peer_service_burst_bytes`) covering inventory pages, manifests, directories, and chunks. Requests are charged an estimated response cost with a 64 KiB minimum; an exhausted peer receives a `429` control error. Inventory pages are served from a cached snapshot rather than rebuilding the full inventory per page.
 - No pinning or garbage collection. Fetched files are cached indefinitely when `cache_fetched = true`.
 - No partial-directory progress sidecar; individual files resume, but already-completed files in a directory are re-exported/fail if the target exists.
