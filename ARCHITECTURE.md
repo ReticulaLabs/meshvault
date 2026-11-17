@@ -399,6 +399,7 @@ Independently of that option, inbound links are rejected if their signalled MTU 
 | Concurrent CLI auto-start | Losing daemon exits; clients keep polling for the winner's RPC socket. |
 | Malicious directory cycle | Recursion stack detects and aborts. |
 | Oversized request | Bounded before allocation/read. |
+| Malformed manifest | Rejected: checked piece-count/size arithmetic, bounded file names, and checked directory size totals. |
 
 ## Performance notes
 

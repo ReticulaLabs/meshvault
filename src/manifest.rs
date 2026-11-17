@@ -145,6 +145,34 @@ impl ObjectSummary {
             Self::Directory(_) => None,
         }
     }
+
+    /// Validate peer-advertised inventory metadata before retaining it.
+    pub fn validate_inventory(&self) -> Result<()> {
+        match self {
+            Self::File(file) => {
+                if !(MIN_PIECE_SIZE..=MAX_PIECE_SIZE).contains(&file.piece_size) {
+                    bail!("inventory file has an invalid piece size");
+                }
+                if file.size > 0 {
+                    let expected = file.size.div_ceil(file.piece_size as u64);
+                    if expected > u32::MAX as u64 || expected != file.pieces as u64 {
+                        bail!("inventory file has an invalid piece count");
+                    }
+                } else if file.pieces != 0 {
+                    bail!("empty inventory file has piece hashes");
+                }
+                if let Some(name) = &file.name {
+                    validate_manifest_name(name)?;
+                }
+            }
+            Self::Directory(dir) => {
+                if let Some(name) = &dir.name {
+                    validate_manifest_name(name)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl From<ManifestSummary> for ObjectSummary {
@@ -181,12 +209,14 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// Number of pieces. An empty file has zero pieces.
+    /// Number of pieces. An empty file has zero pieces. Valid manifests are
+    /// guaranteed to fit in `u32` by [`Self::validate`]; invalid in-memory
+    /// values saturate rather than truncating.
     pub fn piece_count(&self) -> u32 {
         if self.size == 0 {
             0
         } else {
-            self.size.div_ceil(self.piece_size as u64) as u32
+            u32::try_from(self.size.div_ceil(self.piece_size as u64)).unwrap_or(u32::MAX)
         }
     }
 
@@ -195,9 +225,15 @@ impl Manifest {
         if index >= self.piece_count() {
             bail!("piece {index} out of range (count {})", self.piece_count());
         }
-        let start = index as u64 * self.piece_size as u64;
-        let end = (start + self.piece_size as u64).min(self.size);
-        Ok((end - start) as u32)
+        let start = (index as u64)
+            .checked_mul(self.piece_size as u64)
+            .context("piece offset overflow")?;
+        let end = start
+            .checked_add(self.piece_size as u64)
+            .context("piece end overflow")?
+            .min(self.size);
+        let len = end.saturating_sub(start);
+        u32::try_from(len).context("piece length overflow")
     }
 
     /// Byte offset of a piece in the file.
@@ -210,14 +246,16 @@ impl Manifest {
         if count == 0 || start >= self.piece_count() {
             bail!("invalid piece range");
         }
-        let end = (start + count).min(self.piece_count());
+        let end = start.saturating_add(count).min(self.piece_count());
         let start_byte = self.piece_offset(start);
         let end_byte = if end == self.piece_count() {
             self.size
         } else {
             self.piece_offset(end)
         };
-        Ok(end_byte - start_byte)
+        end_byte
+            .checked_sub(start_byte)
+            .context("invalid piece range ordering")
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -276,19 +314,34 @@ impl Manifest {
         if !(MIN_PIECE_SIZE..=MAX_PIECE_SIZE).contains(&self.piece_size) {
             bail!("invalid piece size {}", self.piece_size);
         }
-        let expected = self.piece_count() as usize;
-        if self.pieces.len() != expected {
+        let expected_u64 = if self.size == 0 {
+            0
+        } else {
+            self.size.div_ceil(self.piece_size as u64)
+        };
+        let expected = u32::try_from(expected_u64)
+            .context("manifest has more pieces than the protocol supports")?;
+        if self.pieces.len() != expected as usize {
             bail!(
                 "manifest has {} piece hashes, expected {expected}",
                 self.pieces.len()
             );
         }
-        if self.size > 0 {
-            let last = self.piece_count() - 1;
-            let expected_last = self.size - self.piece_offset(last);
+        if expected > 0 {
+            let last = expected - 1;
+            let offset = (last as u64)
+                .checked_mul(self.piece_size as u64)
+                .context("final piece offset overflow")?;
+            let expected_last = self
+                .size
+                .checked_sub(offset)
+                .context("final piece offset exceeds file size")?;
             if expected_last == 0 || expected_last > self.piece_size as u64 {
                 bail!("inconsistent final piece length");
             }
+        }
+        if let Some(name) = &self.name {
+            validate_manifest_name(name)?;
         }
         Ok(())
     }
@@ -330,6 +383,7 @@ impl DirManifest {
         if self.entries.len() > 1_000_000 {
             bail!("directory has too many entries");
         }
+        self.total_size().context("directory size overflow")?;
         let mut previous: Option<&str> = None;
         for entry in &self.entries {
             validate_entry_name(&entry.name)?;
@@ -365,15 +419,21 @@ impl DirManifest {
         Ok(ContentHash::of(&self.encode()?))
     }
 
-    pub fn total_size(&self) -> u64 {
-        self.entries.iter().map(|entry| entry.size).sum()
+    pub fn total_size(&self) -> Result<u64> {
+        self.entries.iter().try_fold(0u64, |total, entry| {
+            total
+                .checked_add(entry.size)
+                .context("directory size overflow")
+        })
     }
 
     pub fn summary(&self, name: Option<String>, created_at: u64) -> Result<DirSummary> {
+        let entries = u32::try_from(self.entries.len())
+            .context("directory has more entries than the protocol supports")?;
         Ok(DirSummary {
             root: self.root()?,
-            entries: self.entries.len() as u32,
-            total_size: self.total_size(),
+            entries,
+            total_size: self.total_size()?,
             name,
             created_at,
         })
@@ -382,6 +442,19 @@ impl DirManifest {
     pub fn get(&self, name: &str) -> Option<&DirEntry> {
         self.entries.iter().find(|entry| entry.name == name)
     }
+}
+
+fn validate_manifest_name(name: &str) -> Result<()> {
+    if name.len() > 255 {
+        bail!("manifest file name is too long");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        bail!("manifest file name contains a path separator");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("manifest file name contains control characters");
+    }
+    Ok(())
 }
 
 fn validate_entry_name(name: &str) -> Result<()> {
@@ -472,6 +545,108 @@ mod tests {
         let decoded = DirManifest::decode(&b.encode().unwrap()).unwrap();
         assert_eq!(b, decoded);
         assert_eq!(b.root().unwrap(), decoded.root().unwrap());
+    }
+
+    #[test]
+    fn rejects_too_many_pieces() {
+        let too_large = (u32::MAX as u64).saturating_mul(4096).saturating_add(1);
+        let manifest = Manifest::new(
+            ContentHash::of(b"huge"),
+            too_large,
+            4096,
+            Vec::new(),
+            None,
+            0,
+        );
+        assert!(manifest.is_err());
+    }
+
+    #[test]
+    fn rejects_bad_manifest_names() {
+        assert!(
+            Manifest::new(
+                ContentHash::of(b"name"),
+                0,
+                4096,
+                Vec::new(),
+                Some("../escape".into()),
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            Manifest::new(
+                ContentHash::of(b"name"),
+                0,
+                4096,
+                Vec::new(),
+                Some("bad\nname".into()),
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            Manifest::new(
+                ContentHash::of(b"name"),
+                0,
+                4096,
+                Vec::new(),
+                Some("x".repeat(256)),
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn range_len_saturates_instead_of_overflowing() {
+        let manifest = manifest(100_000, 16 * 1024);
+        let len = manifest.range_len(1, u32::MAX).unwrap();
+        assert_eq!(len, manifest.size - 16 * 1024);
+    }
+
+    #[test]
+    fn directory_rejects_size_overflow() {
+        let entries = vec![
+            DirEntry {
+                name: "a".into(),
+                hash: ContentHash::of(b"a"),
+                kind: ObjectKind::File,
+                size: u64::MAX,
+            },
+            DirEntry {
+                name: "b".into(),
+                hash: ContentHash::of(b"b"),
+                kind: ObjectKind::File,
+                size: 1,
+            },
+        ];
+        assert!(DirManifest::new(entries).is_err());
+    }
+
+    #[test]
+    fn inventory_summaries_are_bounded() {
+        let bad_name = ObjectSummary::File(ManifestSummary {
+            root: ContentHash::of(b"f"),
+            size: 0,
+            piece_size: 4096,
+            pieces: 0,
+            name: Some("x".repeat(256)),
+            manifest_hash: ContentHash::of(b"m"),
+            created_at: 0,
+        });
+        assert!(bad_name.validate_inventory().is_err());
+
+        let bad_pieces = ObjectSummary::File(ManifestSummary {
+            root: ContentHash::of(b"f"),
+            size: 10_000,
+            piece_size: 4096,
+            pieces: 1,
+            name: None,
+            manifest_hash: ContentHash::of(b"m"),
+            created_at: 0,
+        });
+        assert!(bad_pieces.validate_inventory().is_err());
     }
 
     #[test]

@@ -930,6 +930,7 @@ impl Node {
                 bail!("peer inventory exceeds max_inventory_objects");
             }
             for object in entries {
+                object.validate_inventory()?;
                 objects.insert(object.root(), object);
             }
             page += 1;
