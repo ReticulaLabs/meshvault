@@ -69,7 +69,7 @@ impl Default for Config {
             data_dir: None,
             control_socket: None,
             name: None,
-            announce_interval_secs: 900,
+            announce_interval_secs: 1800,
             max_peers: 8,
             max_links: 64,
             piece_size: crate::manifest::DEFAULT_PIECE_SIZE,
@@ -162,8 +162,8 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.announce_interval_secs < 60 {
-            bail!("announce_interval_secs must be at least 60");
+        if self.announce_interval_secs < 900 {
+            bail!("announce_interval_secs must be at least 900");
         }
         if self.max_peers == 0 {
             bail!("max_peers must be at least 1");
@@ -228,8 +228,8 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# MeshVault configuration
 # Local RPC socket.  Defaults to <data_dir>/control.sock.
 # control_socket = "/run/user/1000/meshvault.sock"
 
-# Reticulum announce cadence in seconds (minimum 60).
-announce_interval_secs = 900
+# Reticulum announce cadence in seconds (minimum 900).
+announce_interval_secs = 1800
 
 # Maximum outbound peer links, and maximum links in total.
 max_peers = 8
