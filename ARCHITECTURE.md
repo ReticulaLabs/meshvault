@@ -210,6 +210,14 @@ Pre-verification frames are further limited to 64 frames and 16 KiB, and ACKs ar
 
 The byte-credit rule is the anti-amplification invariant: partial ACK output is never larger than the data received since the previous ACK. A peer cannot send tiny frames with `BURST_END` and receive full-size bitmap ACKs in return.
 
+### Peer service budgets
+
+Each verified peer owns a byte token bucket (`peer_service_bytes_per_sec`, burst `peer_service_burst_bytes`). Inventory pages, file manifests, directory manifests, and chunks are charged an estimated response size with a 64 KiB minimum per request. Exhausted budgets return control error `429`, so a peer cannot turn repeated small requests into unbounded inventory scans or disk/network work.
+
+Inventory responses use a cached, sorted snapshot plus a cached digest. Mutations invalidate both, so serving a page costs only the page slice rather than an O(n) clone and sort per request.
+
+Manifest and directory charge estimates are derived from the stored summary (piece count/name length or entry count/name length), and chunk charges are derived from the requested byte range before the blob is read.
+
 The ACK bitmap means retransmission is selective: only missing frames are resent. One ACK is typically a few bytes; for a 1 MiB chunk at 431-byte payloads, the sender sends ~2,500 frames and the final bitmap is only ~313 bytes.
 
 ### Adaptive flow control

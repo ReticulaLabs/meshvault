@@ -46,6 +46,10 @@ pub struct Config {
     pub max_inventory_objects_total: usize,
     /// Process-wide budget for inbound reassembly buffers.
     pub max_inbound_memory_bytes: u64,
+    /// Sustained per-peer service bandwidth (bytes/second).
+    pub peer_service_bytes_per_sec: u64,
+    /// Per-peer service burst allowance (bytes).
+    pub peer_service_burst_bytes: u64,
     /// Keep and advertise files fetched from the mesh.
     pub cache_fetched: bool,
 
@@ -88,6 +92,8 @@ impl Default for Config {
             max_inventory_objects: 16_384,
             max_inventory_objects_total: 65_536,
             max_inbound_memory_bytes: 64 * 1024 * 1024,
+            peer_service_bytes_per_sec: 4 * 1024 * 1024,
+            peer_service_burst_bytes: 8 * 1024 * 1024,
             cache_fetched: true,
             transport_node: false,
             link_mtu_discovery: false,
@@ -200,6 +206,12 @@ impl Config {
         if !(4 * 1024 * 1024..=1024 * 1024 * 1024).contains(&self.max_inbound_memory_bytes) {
             bail!("max_inbound_memory_bytes must be between 4 MiB and 1 GiB");
         }
+        if !(16 * 1024..=1024 * 1024 * 1024).contains(&self.peer_service_bytes_per_sec) {
+            bail!("peer_service_bytes_per_sec must be between 16 KiB/s and 1 GiB/s");
+        }
+        if !(1024 * 1024..=1024 * 1024 * 1024).contains(&self.peer_service_burst_bytes) {
+            bail!("peer_service_burst_bytes must be between 1 MiB and 1 GiB");
+        }
         if !(MIN_PIECE_SIZE..=MAX_PIECE_SIZE).contains(&self.piece_size) {
             bail!("piece_size must be between {MIN_PIECE_SIZE} and {MAX_PIECE_SIZE}");
         }
@@ -275,6 +287,11 @@ max_inventory_objects_total = 65536
 # Process-wide budget for inbound message reassembly. Individual links are
 # additionally capped at 4 MiB in flight.
 max_inbound_memory_bytes = 67108864
+
+# Per-peer service limits for inventory, manifests, directories, and chunks.
+# Requests are charged an estimated response cost; exhausted peers receive 429.
+peer_service_bytes_per_sec = 4194304
+peer_service_burst_bytes = 8388608
 
 # Files are stored as fixed-size hashed pieces.  16 KiB is a good default for
 # mixed LAN/LoRa meshes.

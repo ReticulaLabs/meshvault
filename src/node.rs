@@ -26,7 +26,10 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use crate::config::{Config, Paths};
 use crate::fetch::PieceProgress;
 use crate::hash::ContentHash;
-use crate::manifest::{DirEntry, DirManifest, DirSummary, Manifest, ObjectKind, ObjectSummary};
+use crate::limits::{MIN_REQUEST_COST, ServiceLimiter};
+use crate::manifest::{
+    DirEntry, DirManifest, DirSummary, Manifest, ManifestSummary, ObjectKind, ObjectSummary,
+};
 use crate::session::{Incoming, LinkSession, MAX_LINK_MTU, MemoryBudget, PeerHello};
 use crate::store::{MAX_PIECES_PER_REQUEST, Store, sanitize_name};
 use crate::wire::{
@@ -139,11 +142,12 @@ struct PeerState {
     objects: u32,
     inventory: HashMap<ContentHash, ObjectSummary>,
     inventory_synced: bool,
+    service: Arc<ServiceLimiter>,
     last_error: Option<String>,
 }
 
 impl PeerState {
-    fn new(address: AddressHash) -> Self {
+    fn new(address: AddressHash, service_rate: u64, service_burst: u64) -> Self {
         Self {
             address,
             desc: None,
@@ -160,6 +164,7 @@ impl PeerState {
             objects: 0,
             inventory: HashMap::new(),
             inventory_synced: false,
+            service: Arc::new(ServiceLimiter::new(service_rate, service_burst)),
             last_error: None,
         }
     }
@@ -225,6 +230,8 @@ pub struct NodeStatus {
     pub inbound_buffer_limit: usize,
     pub known_peer_limit: usize,
     pub inventory_object_limit: usize,
+    pub peer_service_bytes_per_sec: u64,
+    pub peer_service_burst_bytes: u64,
     pub transport_node: bool,
     pub connect: Vec<String>,
     pub listen: Vec<String>,
@@ -627,9 +634,13 @@ impl Node {
                     }
                 }
             }
-            let peer = peers
-                .entry(desc.address_hash)
-                .or_insert_with(|| PeerState::new(desc.address_hash));
+            let peer = peers.entry(desc.address_hash).or_insert_with(|| {
+                PeerState::new(
+                    desc.address_hash,
+                    self.config.peer_service_bytes_per_sec,
+                    self.config.peer_service_burst_bytes,
+                )
+            });
             let is_new = peer.desc.is_none();
             if peer.inventory_digest != Some(announce.inventory) || peer.objects != announce.objects
             {
@@ -990,9 +1001,13 @@ impl Node {
                 self.close_session(&session).await;
                 return;
             }
-            let peer = peers
-                .entry(peer_address)
-                .or_insert_with(|| PeerState::new(peer_address));
+            let peer = peers.entry(peer_address).or_insert_with(|| {
+                PeerState::new(
+                    peer_address,
+                    self.config.peer_service_bytes_per_sec,
+                    self.config.peer_service_burst_bytes,
+                )
+            });
             peer.desc = Some(desc);
             peer.identity = Some(desc.identity);
             peer.identity_hash = Some(desc.identity.address_hash);
@@ -1208,9 +1223,13 @@ impl Node {
                 self.close_session(session).await;
                 return;
             }
-            let peer = peers
-                .entry(peer_dest)
-                .or_insert_with(|| PeerState::new(peer_dest));
+            let peer = peers.entry(peer_dest).or_insert_with(|| {
+                PeerState::new(
+                    peer_dest,
+                    self.config.peer_service_bytes_per_sec,
+                    self.config.peer_service_burst_bytes,
+                )
+            });
             peer.desc = Some(desc);
             peer.identity = Some(identity);
             peer.identity_hash = Some(identity.address_hash);
@@ -1353,6 +1372,28 @@ impl Node {
         false
     }
 
+    async fn peer_limiter(&self, session: &Arc<LinkSession>) -> Option<Arc<ServiceLimiter>> {
+        let address = session.verified_peer().await?;
+        let peers = self.peers.lock().await;
+        peers.get(&address).map(|peer| peer.service.clone())
+    }
+
+    async fn respond_rate_limited(&self, session: &Arc<LinkSession>, request: u32) {
+        debug!(
+            "rate limiting peer request {} on link {}",
+            request, session.link_id
+        );
+        let _ = session
+            .respond(
+                request,
+                Control::Error {
+                    code: 429,
+                    message: "peer service rate limit exceeded".into(),
+                },
+            )
+            .await;
+    }
+
     async fn serve_inventory(
         self: &Arc<Self>,
         session: &Arc<LinkSession>,
@@ -1362,8 +1403,16 @@ impl Node {
         if !self.require_verified(session, request).await {
             return;
         }
+        let Some(limiter) = self.peer_limiter(session).await else {
+            self.respond_rate_limited(session, request).await;
+            return;
+        };
+        if !limiter.try_consume(MIN_REQUEST_COST) {
+            self.respond_rate_limited(session, request).await;
+            return;
+        }
         debug!("serving inventory page {page} to {}", session.link_id);
-        let objects = self.store.inventory();
+        let objects = self.store.inventory_snapshot();
         let pages = (objects.len() as u32).div_ceil(INVENTORY_PAGE_SIZE).max(1);
         if page >= pages {
             let _ = session
@@ -1400,6 +1449,28 @@ impl Node {
         if !self.require_verified(session, request).await {
             return;
         }
+        let Some(summary) = self.store.file_summary(root) else {
+            let _ = session
+                .respond(
+                    request,
+                    Control::Error {
+                        code: 404,
+                        message: "manifest unavailable".into(),
+                    },
+                )
+                .await;
+            return;
+        };
+        let Some(limiter) = self.peer_limiter(session).await else {
+            self.respond_rate_limited(session, request).await;
+            return;
+        };
+        let estimated = manifest_service_cost(&summary);
+        if !limiter.try_consume(estimated) {
+            self.respond_rate_limited(session, request).await;
+            return;
+        }
+
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || {
             let manifest = store.read_manifest(root)?;
@@ -1408,8 +1479,15 @@ impl Node {
             Ok::<_, anyhow::Error>((hash, data))
         })
         .await;
+
         match result {
             Ok(Ok((manifest_hash, data))) => {
+                if data.len() as u64 > estimated
+                    && !limiter.try_consume(data.len() as u64 - estimated)
+                {
+                    self.respond_rate_limited(session, request).await;
+                    return;
+                }
                 let _ = session
                     .respond(
                         request,
@@ -1422,12 +1500,13 @@ impl Node {
                     .await;
             }
             Ok(Err(err)) => {
+                debug!("manifest unavailable for {}: {err:#}", root.short());
                 let _ = session
                     .respond(
                         request,
                         Control::Error {
                             code: 404,
-                            message: format!("manifest unavailable: {err:#}"),
+                            message: "manifest unavailable".into(),
                         },
                     )
                     .await;
@@ -1445,6 +1524,28 @@ impl Node {
         if !self.require_verified(session, request).await {
             return;
         }
+        let Some(summary) = self.store.dir_summary(root) else {
+            let _ = session
+                .respond(
+                    request,
+                    Control::Error {
+                        code: 404,
+                        message: "directory unavailable".into(),
+                    },
+                )
+                .await;
+            return;
+        };
+        let Some(limiter) = self.peer_limiter(session).await else {
+            self.respond_rate_limited(session, request).await;
+            return;
+        };
+        let estimated = directory_service_cost(&summary);
+        if !limiter.try_consume(estimated) {
+            self.respond_rate_limited(session, request).await;
+            return;
+        }
+
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || {
             let manifest = store.read_dir_manifest(root)?;
@@ -1453,17 +1554,24 @@ impl Node {
         .await;
         match result {
             Ok(Ok(data)) => {
+                if data.len() as u64 > estimated
+                    && !limiter.try_consume(data.len() as u64 - estimated)
+                {
+                    self.respond_rate_limited(session, request).await;
+                    return;
+                }
                 let _ = session
                     .respond(request, Control::Directory { root, data })
                     .await;
             }
             Ok(Err(err)) => {
+                debug!("directory unavailable for {}: {err:#}", root.short());
                 let _ = session
                     .respond(
                         request,
                         Control::Error {
                             code: 404,
-                            message: format!("directory unavailable: {err:#}"),
+                            message: "directory unavailable".into(),
                         },
                     )
                     .await;
@@ -1495,7 +1603,18 @@ impl Node {
                 .await;
             return;
         }
-        let store = self.store.clone();
+        let Some(summary) = self.store.file_summary(root) else {
+            let _ = session
+                .respond(
+                    request,
+                    Control::Error {
+                        code: 404,
+                        message: "file unavailable".into(),
+                    },
+                )
+                .await;
+            return;
+        };
         let budget = match session.budget().await {
             Ok(budget) => budget,
             Err(err) => {
@@ -1504,23 +1623,60 @@ impl Node {
             }
         };
         let max_bytes = budget.max_message_bytes.saturating_sub(CHUNK_HEADER_LEN);
+        let total = summary.pieces;
+        if start >= total {
+            let _ = session
+                .respond(
+                    request,
+                    Control::Error {
+                        code: 400,
+                        message: "chunk start out of range".into(),
+                    },
+                )
+                .await;
+            return;
+        }
+        let actual = count.min(total - start);
+        let piece_size = summary.piece_size as u64;
+        let start_byte = start as u64 * piece_size;
+        let end_byte = if start + actual == total {
+            summary.size
+        } else {
+            (start + actual) as u64 * piece_size
+        };
+        let length = end_byte.saturating_sub(start_byte);
+        if length as usize > max_bytes {
+            let _ = session
+                .respond(
+                    request,
+                    Control::Error {
+                        code: 400,
+                        message: "requested chunk exceeds link message budget".into(),
+                    },
+                )
+                .await;
+            return;
+        }
+
+        let Some(limiter) = self.peer_limiter(session).await else {
+            self.respond_rate_limited(session, request).await;
+            return;
+        };
+        if !limiter.try_consume(length.saturating_add(CHUNK_HEADER_LEN as u64)) {
+            self.respond_rate_limited(session, request).await;
+            return;
+        }
+
+        let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || {
             let manifest = store.read_manifest(root)?;
-            if start >= manifest.piece_count() {
-                bail!("chunk start out of range");
-            }
-            let actual = count.min(manifest.piece_count() - start);
-            let length = manifest.range_len(start, actual)?;
-            if length as usize > max_bytes {
-                bail!("requested chunk exceeds link message budget");
-            }
             let data = store.read_chunk(&manifest, start, actual)?;
-            Ok::<_, anyhow::Error>((actual, data))
+            Ok::<_, anyhow::Error>(data)
         })
         .await;
 
         match result {
-            Ok(Ok((actual, data))) => {
+            Ok(Ok(data)) => {
                 let chunk = ChunkMessage {
                     request,
                     root,
@@ -1533,12 +1689,13 @@ impl Node {
                 }
             }
             Ok(Err(err)) => {
+                debug!("chunk unavailable for {}: {err:#}", root.short());
                 let _ = session
                     .respond(
                         request,
                         Control::Error {
-                            code: 400,
-                            message: format!("{err:#}"),
+                            code: 404,
+                            message: "chunk unavailable".into(),
                         },
                     )
                     .await;
@@ -2200,6 +2357,8 @@ impl Node {
             inbound_buffer_limit: self.memory_budget.limit(),
             known_peer_limit: self.config.max_known_peers,
             inventory_object_limit: self.config.max_inventory_objects,
+            peer_service_bytes_per_sec: self.config.peer_service_bytes_per_sec,
+            peer_service_burst_bytes: self.config.peer_service_burst_bytes,
             transport_node: self.config.transport_node,
             connect: self.config.interfaces.connect.clone(),
             listen: self.config.interfaces.listen.clone(),
@@ -2365,6 +2524,22 @@ async fn inventory_broadcast_loop(node: Arc<Node>) {
         }
         node.announce_now.notify_one();
     }
+}
+
+fn manifest_service_cost(summary: &ManifestSummary) -> u64 {
+    (summary.pieces as u64)
+        .saturating_mul(72)
+        .saturating_add(summary.name.as_ref().map_or(0, |name| name.len() as u64))
+        .saturating_add(1024)
+        .max(MIN_REQUEST_COST)
+}
+
+fn directory_service_cost(summary: &DirSummary) -> u64 {
+    (summary.entries as u64)
+        .saturating_mul(384)
+        .saturating_add(summary.name.as_ref().map_or(0, |name| name.len() as u64))
+        .saturating_add(1024)
+        .max(MIN_REQUEST_COST)
 }
 
 fn verify_and_write_chunk(

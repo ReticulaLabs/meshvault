@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -50,6 +50,8 @@ pub struct Store {
     tmp_dir: PathBuf,
     files: RwLock<HashMap<ContentHash, ManifestSummary>>,
     dirs: RwLock<HashMap<ContentHash, DirSummary>>,
+    inventory_cache: RwLock<Option<Arc<Vec<ObjectSummary>>>>,
+    digest_cache: RwLock<Option<ContentHash>>,
 }
 
 impl Store {
@@ -83,6 +85,8 @@ impl Store {
             tmp_dir,
             files: RwLock::new(HashMap::new()),
             dirs: RwLock::new(HashMap::new()),
+            inventory_cache: RwLock::new(None),
+            digest_cache: RwLock::new(None),
         };
         store.rebuild_index()?;
         Ok(store)
@@ -219,12 +223,18 @@ impl Store {
 
         *self.files.write().unwrap() = files;
         *self.dirs.write().unwrap() = dirs;
+        self.invalidate_inventory_cache();
         info!(
             "repository: {} file(s), {} directory manifest(s) indexed",
             self.files.read().unwrap().len(),
             self.dirs.read().unwrap().len()
         );
         Ok(())
+    }
+
+    fn invalidate_inventory_cache(&self) {
+        *self.inventory_cache.write().unwrap() = None;
+        *self.digest_cache.write().unwrap() = None;
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -286,7 +296,16 @@ impl Store {
         }
     }
 
-    pub fn inventory(&self) -> Vec<ObjectSummary> {
+    /// Cached, sorted inventory snapshot.  Page serving clones only the
+    /// requested page instead of rebuilding the whole inventory per request.
+    pub fn inventory_snapshot(&self) -> Arc<Vec<ObjectSummary>> {
+        if let Some(snapshot) = self.inventory_cache.read().unwrap().as_ref().cloned() {
+            return snapshot;
+        }
+        let mut cache = self.inventory_cache.write().unwrap();
+        if let Some(snapshot) = cache.as_ref().cloned() {
+            return snapshot;
+        }
         let mut objects: Vec<ObjectSummary> = self
             .files
             .read()
@@ -304,7 +323,13 @@ impl Store {
             )
             .collect();
         objects.sort_by_key(|object| object.root());
-        objects
+        let snapshot = Arc::new(objects);
+        *cache = Some(snapshot.clone());
+        snapshot
+    }
+
+    pub fn inventory(&self) -> Vec<ObjectSummary> {
+        (*self.inventory_snapshot()).clone()
     }
 
     pub fn file_count(&self) -> usize {
@@ -322,14 +347,18 @@ impl Store {
     /// Deterministic digest of the current inventory.  Peers exchange this
     /// tiny value instead of repeatedly broadcasting full file lists.
     pub fn inventory_digest(&self) -> ContentHash {
-        let mut objects = self.inventory();
-        objects.sort_by_key(|object| object.root());
+        if let Some(digest) = *self.digest_cache.read().unwrap() {
+            return digest;
+        }
+        let objects = self.inventory_snapshot();
         let mut hasher = blake3::Hasher::new();
-        for object in objects {
+        for object in objects.iter() {
             hasher.update(object.root().as_bytes());
             hasher.update(object.manifest_hash().as_bytes());
         }
-        ContentHash::from_hasher(hasher)
+        let digest = ContentHash::from_hasher(hasher);
+        *self.digest_cache.write().unwrap() = Some(digest);
+        digest
     }
 
     /// Import a file into the repository.  Streams the input, hashing each
@@ -411,6 +440,7 @@ impl Store {
             .write()
             .unwrap()
             .insert(root, final_manifest.summary()?);
+        self.invalidate_inventory_cache();
         Ok(final_manifest)
     }
 
@@ -491,6 +521,7 @@ impl Store {
         if let Some(summary) = self.dirs.write().unwrap().get_mut(&root) {
             summary.name = name;
         }
+        self.invalidate_inventory_cache();
         Ok(())
     }
 
@@ -527,6 +558,7 @@ impl Store {
             unix_now(),
         )?;
         self.dirs.write().unwrap().insert(root, summary.clone());
+        self.invalidate_inventory_cache();
         Ok(summary)
     }
 
@@ -697,6 +729,7 @@ impl Store {
             .write()
             .unwrap()
             .insert(manifest.root, manifest.summary()?);
+        self.invalidate_inventory_cache();
         Ok(())
     }
 
@@ -761,6 +794,9 @@ impl Store {
         let _ = fs::remove_file(self.partial_path(root));
         let _ = fs::remove_file(self.dir_manifest_path(root));
         let _ = fs::remove_file(self.dir_name_path(root));
+        if known_file || known_dir {
+            self.invalidate_inventory_cache();
+        }
         Ok(known_file || known_dir)
     }
 
@@ -934,6 +970,25 @@ mod tests {
         assert!(manifest.verify_piece(0, &bad).is_err());
         bad.copy_from_slice(&fs::read(&source).unwrap());
         manifest.verify_piece(0, &bad).unwrap();
+    }
+
+    #[test]
+    fn inventory_cache_tracks_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = write_temp_file(temp.path(), "cached.bin", 2048);
+        let store = Store::open(&temp.path().join("repo")).unwrap();
+
+        let empty = store.inventory_snapshot();
+        let empty_digest = store.inventory_digest();
+        assert!(empty.is_empty());
+
+        let manifest = store.import_file(&source, 4096, None).unwrap();
+        let populated = store.inventory_snapshot();
+        assert_eq!(populated.len(), 1);
+        assert_ne!(store.inventory_digest(), empty_digest);
+
+        assert!(store.remove(manifest.root).unwrap());
+        assert!(store.inventory_snapshot().is_empty());
     }
 
     #[test]

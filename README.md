@@ -206,6 +206,8 @@ fetch_parallelism = 4            # parallel source peers per file (1 disables)
 max_inventory_objects = 16384    # inventory entries accepted per peer
 max_inventory_objects_total = 65536  # inventory entries across all peers
 max_inbound_memory_bytes = 67108864  # 64 MiB global reassembly budget
+peer_service_bytes_per_sec = 4194304  # per-peer serving rate (4 MiB/s)
+peer_service_burst_bytes = 8388608    # per-peer burst allowance (8 MiB)
 cache_fetched = true             # keep and advertise fetched content
 transport_node = false           # forward traffic for other Reticulum nodes
 link_mtu_discovery = false       # keep interoperable 500-byte Reticulum MTU
@@ -269,6 +271,7 @@ The end-to-end development check runs daemons over Reticulum TCP, adds files/dir
 - Parallel sources must advertise the same manifest hash, which means the same piece size/layout. A peer that imported the file with a different `piece_size` is excluded from that fetch.
 - Peers with more than `max_inventory_objects` entries are not fully synchronized; raise that limit (and `max_inventory_objects_total`) for repositories with many files. Disconnected peers are evicted after one hour, and the retained peer table is capped by `max_known_peers`.
 - Inbound reassembly is bounded per link (4 MiB) and globally by `max_inbound_memory_bytes`; frames that would exceed the global budget are dropped and retried by the sender.
+- Each peer has a service token bucket (`peer_service_bytes_per_sec` / `peer_service_burst_bytes`) covering inventory pages, manifests, directories, and chunks. Requests are charged an estimated response cost with a 64 KiB minimum; an exhausted peer receives a `429` control error. Inventory pages are served from a cached snapshot rather than rebuilding the full inventory per page.
 - No pinning or garbage collection. Fetched files are cached indefinitely when `cache_fetched = true`.
 - No partial-directory progress sidecar; individual files resume, but already-completed files in a directory are re-exported/fail if the target exists.
 - Pieces are fetched in adaptive contiguous ranges, not individual pieces, which keeps protocol overhead low but can leave an under-filled tail when one source is much slower.
