@@ -78,6 +78,24 @@ struct TransferControl<'a> {
     progress: Option<&'a ProgressSender>,
 }
 
+/// Where a fetched file should end up after it is stored.
+#[derive(Clone, Copy)]
+enum FetchOutput<'a> {
+    /// Keep the object in the repository and copy it to this path.
+    Export(Option<&'a Path>),
+    /// Keep the object in the repository without exporting it.
+    Store,
+}
+
+/// How a fetched directory tree should be handled.
+#[derive(Clone, Copy)]
+enum DirectoryOutput<'a> {
+    /// Store every object and extract the tree to this directory.
+    Extract(&'a Path),
+    /// Store every object without writing anything outside the repository.
+    Store,
+}
+
 fn send_progress(
     sender: Option<&ProgressSender>,
     stage: &str,
@@ -107,7 +125,7 @@ impl ExtractionBudget {
 
     fn consume_entry(&mut self) -> Result<()> {
         if self.entries == 0 {
-            bail!("directory extraction entry budget exhausted");
+            bail!("entry budget exhausted (raise max_extract_entries)");
         }
         self.entries -= 1;
         Ok(())
@@ -115,7 +133,7 @@ impl ExtractionBudget {
 
     fn consume_bytes(&mut self, bytes: u64) -> Result<()> {
         if bytes > self.bytes {
-            bail!("directory extraction byte budget exhausted");
+            bail!("byte budget exhausted (raise max_extract_bytes)");
         }
         self.bytes -= bytes;
         Ok(())
@@ -351,7 +369,9 @@ pub struct AddResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FetchResult {
     pub object: ObjectSummary,
-    pub path: PathBuf,
+    /// Export destination, or `None` when the object was fetched only into the
+    /// repository (pin).
+    pub path: Option<PathBuf>,
     pub bytes: u64,
     pub resumed: bool,
     /// Peers that contributed data to this fetch.
@@ -362,6 +382,12 @@ pub struct FetchResult {
 pub struct GetResult {
     pub object: ObjectSummary,
     pub path: PathBuf,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PinResult {
+    pub object: ObjectSummary,
     pub bytes: u64,
 }
 
@@ -652,7 +678,9 @@ impl Node {
         let ObjectSummary::Directory(summary) = object else {
             bail!("{} is a file, not a directory", root.short());
         };
-        let manifest = self.get_dir_manifest(root, Some(&summary), &cancel).await?;
+        let manifest = self
+            .get_dir_manifest(root, Some(&summary), &cancel, false)
+            .await?;
         Ok(DirListing {
             root,
             name: summary.name,
@@ -692,7 +720,7 @@ impl Node {
                 let result = self
                     .fetch_file(
                         root,
-                        output,
+                        FetchOutput::Export(output.as_deref()),
                         None,
                         TransferControl {
                             cancel: &cancel,
@@ -702,7 +730,7 @@ impl Node {
                     .await?;
                 Ok(GetResult {
                     object: result.object,
-                    path: result.path,
+                    path: result.path.context("export path missing")?,
                     bytes: result.bytes,
                 })
             }
@@ -755,7 +783,7 @@ impl Node {
                 let mut stack = Vec::new();
                 self.fetch_dir_recursive(
                     root,
-                    &target,
+                    DirectoryOutput::Extract(&target),
                     &mut stack,
                     0,
                     &mut budget,
@@ -772,6 +800,87 @@ impl Node {
                 })
             }
         }
+    }
+
+    /// Fetch a file or directory tree into the local repository without
+    /// exporting it.  Pinned content is retained even when
+    /// `cache_fetched = false`, and is announced to peers like any other
+    /// locally hosted object.
+    pub async fn pin(
+        self: &Arc<Self>,
+        root: ContentHash,
+        cancel: CancelToken,
+        progress: Option<ProgressSender>,
+    ) -> Result<PinResult> {
+        if cancel.is_cancelled() {
+            bail!("operation cancelled");
+        }
+        send_progress(
+            progress.as_ref(),
+            "resolving",
+            "resolving object",
+            None,
+            None,
+        );
+        let object = self
+            .resolve_object(
+                root,
+                Duration::from_secs(self.config.fetch_wait_secs.max(5)),
+                &cancel,
+            )
+            .await?;
+        let result = match object {
+            ObjectSummary::File(_) => {
+                send_progress(progress.as_ref(), "file", "fetching file", Some(0), None);
+                let result = self
+                    .fetch_file(
+                        root,
+                        FetchOutput::Store,
+                        None,
+                        TransferControl {
+                            cancel: &cancel,
+                            progress: progress.as_ref(),
+                        },
+                    )
+                    .await?;
+                PinResult {
+                    object: result.object,
+                    bytes: result.bytes,
+                }
+            }
+            ObjectSummary::Directory(summary) => {
+                let mut budget = ExtractionBudget::new(
+                    self.config.max_extract_entries,
+                    self.config.max_extract_bytes,
+                );
+                send_progress(
+                    progress.as_ref(),
+                    "directory",
+                    "pinning directory",
+                    Some(0),
+                    Some(summary.entries as u64),
+                );
+                let mut stack = Vec::new();
+                self.fetch_dir_recursive(
+                    root,
+                    DirectoryOutput::Store,
+                    &mut stack,
+                    0,
+                    &mut budget,
+                    TransferControl {
+                        cancel: &cancel,
+                        progress: progress.as_ref(),
+                    },
+                )
+                .await?;
+                PinResult {
+                    object: ObjectSummary::Directory(summary.clone()),
+                    bytes: summary.total_size,
+                }
+            }
+        };
+        self.notify_inventory_changed();
+        Ok(result)
     }
 
     // ─── Announcements and peers ────────────────────────────────────────────
@@ -2040,7 +2149,7 @@ impl Node {
     async fn fetch_file(
         self: &Arc<Self>,
         root: ContentHash,
-        output: Option<PathBuf>,
+        output: FetchOutput<'_>,
         mut budget: Option<&mut ExtractionBudget>,
         control: TransferControl<'_>,
     ) -> Result<FetchResult> {
@@ -2057,12 +2166,30 @@ impl Node {
             if let Some(budget) = budget.as_deref_mut() {
                 budget.consume_bytes(size)?;
             }
-            send_progress(progress_tx, "saving", "copying local file", Some(0), None);
-            let store = self.store.clone();
-            let out = output.clone();
-            let path = tokio::task::spawn_blocking(move || store.export(root, out.as_deref()))
-                .await
-                .context("export task panicked")??;
+            let path = match output {
+                FetchOutput::Export(destination) => {
+                    send_progress(progress_tx, "saving", "copying local file", Some(0), None);
+                    let store = self.store.clone();
+                    let destination = destination.map(Path::to_path_buf);
+                    Some(
+                        tokio::task::spawn_blocking(move || {
+                            store.export(root, destination.as_deref())
+                        })
+                        .await
+                        .context("export task panicked")??,
+                    )
+                }
+                FetchOutput::Store => {
+                    send_progress(
+                        progress_tx,
+                        "saving",
+                        "already in repository",
+                        Some(0),
+                        None,
+                    );
+                    None
+                }
+            };
             let object = self
                 .store
                 .object_summary(root)
@@ -2358,11 +2485,18 @@ impl Node {
             .await
             .context("finalize task panicked")??;
 
-        let store = self.store.clone();
-        let out = output.clone();
-        let path = tokio::task::spawn_blocking(move || store.export(root, out.as_deref()))
-            .await
-            .context("export task panicked")??;
+        let path = match output {
+            FetchOutput::Export(destination) => {
+                let store = self.store.clone();
+                let destination = destination.map(Path::to_path_buf);
+                Some(
+                    tokio::task::spawn_blocking(move || store.export(root, destination.as_deref()))
+                        .await
+                        .context("export task panicked")??,
+                )
+            }
+            FetchOutput::Store => None,
+        };
 
         let object = self
             .store
@@ -2370,7 +2504,7 @@ impl Node {
             .context("fetched file summary missing")?;
         let bytes = manifest.size;
 
-        if !self.config.cache_fetched {
+        if !self.config.cache_fetched && matches!(output, FetchOutput::Export(_)) {
             let store = self.store.clone();
             let _ = tokio::task::spawn_blocking(move || store.remove(root)).await;
         }
@@ -2498,6 +2632,7 @@ impl Node {
         root: ContentHash,
         summary: Option<&DirSummary>,
         cancel: &CancelToken,
+        force_cache: bool,
     ) -> Result<DirManifest> {
         if cancel.is_cancelled() {
             bail!("operation cancelled");
@@ -2542,7 +2677,7 @@ impl Node {
                     if manifest.root()? != root {
                         bail!("directory manifest hash mismatch");
                     }
-                    if self.config.cache_fetched {
+                    if self.config.cache_fetched || force_cache {
                         let store = self.store.clone();
                         let manifest_for_store = manifest.clone();
                         let name = summary.name.clone();
@@ -2575,7 +2710,7 @@ impl Node {
     async fn fetch_dir_recursive(
         self: &Arc<Self>,
         root: ContentHash,
-        target: &Path,
+        output: DirectoryOutput<'_>,
         stack: &mut Vec<ContentHash>,
         depth: usize,
         budget: &mut ExtractionBudget,
@@ -2593,9 +2728,14 @@ impl Node {
             bail!("directory cycle detected at {}", root.short());
         }
         stack.push(root);
-        let manifest = self.get_dir_manifest(root, None, cancel).await?;
-        fs::create_dir_all(target)
-            .with_context(|| format!("create directory {}", target.display()))?;
+        let force_cache = matches!(output, DirectoryOutput::Store);
+        let manifest = self
+            .get_dir_manifest(root, None, cancel, force_cache)
+            .await?;
+        if let DirectoryOutput::Extract(target) = output {
+            fs::create_dir_all(target)
+                .with_context(|| format!("create directory {}", target.display()))?;
+        }
 
         let total_entries = manifest.entries.len() as u64;
         for (index, entry) in manifest.entries.into_iter().enumerate() {
@@ -2610,26 +2750,40 @@ impl Node {
                 Some(index as u64 + 1),
                 Some(total_entries),
             );
-            let Some(name) = sanitize_name(&entry.name) else {
-                warn!("skipping unsafe directory entry name {:?}", entry.name);
-                continue;
+            let child = match output {
+                DirectoryOutput::Extract(target) => {
+                    let Some(name) = sanitize_name(&entry.name) else {
+                        warn!("skipping unsafe directory entry name {:?}", entry.name);
+                        continue;
+                    };
+                    let child = target.join(&name);
+                    if fs::symlink_metadata(&child).is_ok() {
+                        bail!(
+                            "refusing existing/symlink extraction path {}",
+                            child.display()
+                        );
+                    }
+                    Some(child)
+                }
+                DirectoryOutput::Store => None,
             };
-            let child = target.join(&name);
-            if fs::symlink_metadata(&child).is_ok() {
-                bail!(
-                    "refusing existing/symlink extraction path {}",
-                    child.display()
-                );
-            }
             match entry.kind {
                 ObjectKind::File => {
-                    self.fetch_file(entry.hash, Some(child), Some(budget), control)
+                    let file_output = match &child {
+                        Some(child) => FetchOutput::Export(Some(child)),
+                        None => FetchOutput::Store,
+                    };
+                    self.fetch_file(entry.hash, file_output, Some(budget), control)
                         .await?;
                 }
                 ObjectKind::Directory => {
+                    let dir_output = match &child {
+                        Some(child) => DirectoryOutput::Extract(child),
+                        None => DirectoryOutput::Store,
+                    };
                     Box::pin(self.fetch_dir_recursive(
                         entry.hash,
-                        &child,
+                        dir_output,
                         stack,
                         depth + 1,
                         budget,

@@ -46,9 +46,9 @@ pub struct Config {
     pub max_inventory_objects: usize,
     /// Maximum inventory entries retained across all peers.
     pub max_inventory_objects_total: usize,
-    /// Maximum directory entries materialized by one recursive get.
+    /// Maximum directory entries visited by one recursive get or pin.
     pub max_extract_entries: usize,
-    /// Maximum file bytes materialized by one recursive get.
+    /// Maximum file bytes visited by one recursive get or pin.
     pub max_extract_bytes: u64,
     /// Process-wide budget for inbound reassembly buffers.
     pub max_inbound_memory_bytes: u64,
@@ -56,7 +56,8 @@ pub struct Config {
     pub peer_service_bytes_per_sec: u64,
     /// Per-peer service burst allowance (bytes).
     pub peer_service_burst_bytes: u64,
-    /// Keep and advertise files fetched from the mesh.
+    /// Keep and advertise files fetched from the mesh by `get`.  `pin`
+    /// always retains its content regardless of this setting.
     pub cache_fetched: bool,
 
     /// Participate in Reticulum transport (forward other nodes' traffic).
@@ -319,7 +320,8 @@ piece_size = 16384
 # Upper bound for one adaptive transfer chunk (bytes).
 max_chunk_bytes = 1048576
 
-# How long `meshvault get` waits for a peer to advertise the requested hash.
+# How long `meshvault get` and `meshvault pin` wait for a peer to advertise
+# the requested hash.
 fetch_wait_secs = 20
 
 # Abort a fetch after this many seconds without verified progress.
@@ -329,7 +331,8 @@ fetch_stall_timeout_secs = 3600
 # multi-source fetching.
 fetch_parallelism = 4
 
-# Keep files fetched from the mesh and advertise them to other peers.
+# Keep files fetched by `get` and advertise them to other peers.  `pin` always
+# keeps and advertises its content regardless of this setting.
 cache_fetched = true
 
 # Act as a Reticulum transport node (forward traffic for other nodes).

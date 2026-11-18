@@ -11,7 +11,7 @@ use meshvault::control;
 use meshvault::hash::ContentHash;
 use meshvault::manifest::{DirEntry, ObjectKind, ObjectSummary};
 use meshvault::node::{
-    DirListing, Node, PeerInfo, SourceEntry, SourceInfo, destination_name, load_identity,
+    DirListing, Node, PeerInfo, PinResult, SourceEntry, SourceInfo, destination_name, load_identity,
 };
 use reticulum_sdk::destination::SingleInputDestination;
 
@@ -89,6 +89,9 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Fetch an object or tree into the repository and keep hosting it.
+    Pin { hash: String },
 
     /// List top-level objects, a directory by hash, or the flat inventory.
     Ls {
@@ -206,52 +209,32 @@ async fn main() -> Result<()> {
         }
         Command::Get { hash, output } => {
             let root = ContentHash::from_hex(&hash)?;
-            let interactive = std::io::stderr().is_terminal();
             eprintln!("contacting meshvault daemon");
             let mut client = control::client_for(&paths).await?;
-            let mut last_stage = String::new();
-            let mut last_bucket = u64::MAX;
+            let mut ui = ProgressUi::new();
             let result = client
                 .call_with_progress("get", json!({"hash": root, "output": output}), |event| {
-                    let stage = event
-                        .get("stage")
-                        .and_then(Value::as_str)
-                        .unwrap_or("working");
-                    let message = event.get("message").and_then(Value::as_str).unwrap_or("");
-                    let current = event.get("current").and_then(Value::as_u64);
-                    let total = event.get("total").and_then(Value::as_u64);
-                    let line = match (current, total) {
-                        (Some(current), Some(total)) if total > 0 => {
-                            format!("{stage}: {message} ({current}/{total})")
-                        }
-                        (Some(current), _) => format!("{stage}: {message} ({current})"),
-                        _ => format!("{stage}: {message}"),
-                    };
-                    if interactive {
-                        eprint!("\r\x1b[2K{line}");
-                        let _ = std::io::stderr().flush();
-                    } else {
-                        let bucket = current
-                            .zip(total)
-                            .and_then(|(current, total)| {
-                                current.checked_mul(10)?.checked_div(total)
-                            })
-                            .unwrap_or(0);
-                        if stage != last_stage || bucket != last_bucket {
-                            eprintln!("{line}");
-                            last_stage = stage.to_string();
-                            last_bucket = bucket;
-                        }
-                    }
+                    ui.report(event)
                 })
                 .await?;
-            if interactive {
-                eprint!("\r\x1b[2K");
-                let _ = std::io::stderr().flush();
-            }
+            ui.finish();
             let path = result.get("path").and_then(Value::as_str).unwrap_or("?");
             let bytes = result.get("bytes").and_then(Value::as_u64).unwrap_or(0);
             println!("saved {path} ({})", human_size(bytes));
+            Ok(())
+        }
+        Command::Pin { hash } => {
+            let root = ContentHash::from_hex(&hash)?;
+            eprintln!("contacting meshvault daemon");
+            let mut client = control::client_for(&paths).await?;
+            let mut ui = ProgressUi::new();
+            let result = client
+                .call_with_progress("pin", json!({"hash": root}), |event| ui.report(event))
+                .await?;
+            ui.finish();
+            let result: PinResult = serde_json::from_value(result)?;
+            print!("pinned ");
+            print_object(&result.object);
             Ok(())
         }
         Command::Ls { hash, all } => {
@@ -405,6 +388,60 @@ fn init_logging(verbosity: u8) {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default))
         .format_timestamp_secs()
         .init();
+}
+
+struct ProgressUi {
+    interactive: bool,
+    last_stage: String,
+    last_bucket: u64,
+}
+
+impl ProgressUi {
+    fn new() -> Self {
+        Self {
+            interactive: std::io::stderr().is_terminal(),
+            last_stage: String::new(),
+            last_bucket: u64::MAX,
+        }
+    }
+
+    fn report(&mut self, event: &Value) {
+        let stage = event
+            .get("stage")
+            .and_then(Value::as_str)
+            .unwrap_or("working");
+        let message = event.get("message").and_then(Value::as_str).unwrap_or("");
+        let current = event.get("current").and_then(Value::as_u64);
+        let total = event.get("total").and_then(Value::as_u64);
+        let line = match (current, total) {
+            (Some(current), Some(total)) if total > 0 => {
+                format!("{stage}: {message} ({current}/{total})")
+            }
+            (Some(current), _) => format!("{stage}: {message} ({current})"),
+            _ => format!("{stage}: {message}"),
+        };
+        if self.interactive {
+            eprint!("\r\x1b[2K{line}");
+            let _ = std::io::stderr().flush();
+        } else {
+            let bucket = current
+                .zip(total)
+                .and_then(|(current, total)| current.checked_mul(10)?.checked_div(total))
+                .unwrap_or(0);
+            if stage != self.last_stage || bucket != self.last_bucket {
+                eprintln!("{line}");
+                self.last_stage = stage.to_string();
+                self.last_bucket = bucket;
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.interactive {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        }
+    }
 }
 
 fn print_object(object: &ObjectSummary) {

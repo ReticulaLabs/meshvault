@@ -309,19 +309,21 @@ Chunk bodies have a 44-byte header (request id, 32-byte root, start piece, piece
    - writes pieces with positional `pwrite` calls into the shared partial file
    - marks the range verified and claims the next range
 7. A failed range is released back to the pool and retried with half as many pieces (up to three attempts on that peer). If the peer still fails, it enters a short cooldown and other workers continue.
-8. When every piece is verified, `fsync` the partial file, verify the full BLAKE3 root, atomically promote it to `blobs/`, write the manifest, cache/advertise if configured, and export to the output path.
+8. When every piece is verified, `fsync` the partial file, verify the full BLAKE3 root, atomically promote it to `blobs/`, write the manifest, cache/advertise if configured, and export to the output path (a `pin` stops after storing).
 
 Workers never overlap piece ranges, and verification-before-write prevents a corrupt chunk from leaving partial state in the shared progress bitmap. The partial file is opened once and shared; `write_at`/`pwrite` avoids seeks and cross-worker locking.
 
 ### Directory
 
 1. Fetch the directory manifest and verify its BLAKE3 directory hash.
-2. Create a per-get extraction budget (`max_extract_entries`, `max_extract_bytes`).
+2. Create a per-get/pin budget (`max_extract_entries`, `max_extract_bytes`).
 3. Consume one entry per listed child and the actual manifest size of every file before transfer.
-4. Materialize entries in sorted order.
+4. Materialize entries in sorted order (`pin` skips filesystem materialization).
 5. Files use the file fetch flow.
 6. Child directories recurse, with a depth limit and a stack-based cycle check.
 7. Unsafe entry names are rejected/skipped; symlink output paths and pre-existing/symlink child paths are refused; output never escapes the target directory.
+
+`pin` shares both flows with two differences: fetched files are never exported, and fetched manifests/files are retained regardless of `cache_fetched`. Recursive pinning still enforces the same budgets, depth limit, and cycle check.
 
 ## Storage design
 
@@ -350,7 +352,7 @@ Startup behavior:
 - Unix domain socket, mode `0600`.
 - Newline-delimited JSON so it can be driven by shell tools.
 - One request/response per line; long operations hold their connection.
-- `get` streams advisory `{"id":N,"progress":{stage,message,current,total}}` lines before its final response, so the CLI can show live transfer and extraction status. Progress is best-effort and never replaces the final response.
+- `get` and `pin` stream advisory `{"id":N,"progress":{stage,message,current,total}}` lines before their final response, so the CLI can show live transfer and extraction status. Progress is best-effort and never replaces the final response.
 - The CLI auto-starts the daemon if the socket is not alive, waits for a ping, and then forwards the operation. This is why `meshvault get ...` works without a separate service-management step.
 - The daemon only exposes local operations. There is no remote RPC.
 

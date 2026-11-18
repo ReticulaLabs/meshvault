@@ -11,6 +11,7 @@ Files and directory trees are identified by BLAKE3 hashes. File data is transfer
 - **BLAKE3 content addressing.** File hashes cover the complete file; per-piece hashes allow incremental verification and resumption.
 - **Content-addressed directories.** A directory hash covers a canonical, sorted listing of names → child file/directory hashes. Listings can be fetched without downloading the contents.
 - **Recursive retrieval.** `get <directory-hash>` fetches the directory manifest and the whole tree.
+- **Pinning.** `pin <hash>` fetches a file or whole tree into the local repository and keeps hosting it without exporting a copy.
 - **Bandwidth-aware transfer.** App-level selective-repeat with compact bitmap ACKs, adaptive send windows, and chunks that grow from one piece to a configured maximum based on measured throughput.
 - **Multi-source fetching.** A file is split into disjoint piece ranges and fetched from up to `fetch_parallelism` peers concurrently, with unified verification and resume.
 - **Source visibility.** `sources <hash>` reports the known local and remote copies of an object, including peer address, hop count, and signal quality.
@@ -117,9 +118,16 @@ resolving: resolving object
 downloading: photos (120/1841)
 directory: raw (1/1841)
 saved ./received (2.4 GiB)
+
+$ meshvault pin 8a7c50c319772dad60d8ddbe8ccd1463a9519b9b4b2115d2b87cbf2bcc6044f1
+resolving: resolving object
+directory: raw (1/1841)
+pinned directory  8a7c50c3...  2.4 GiB  photos  (1841 entries)
 ```
 
 `get` writes live progress to stderr while it resolves, downloads pieces, and extracts a directory tree. The final `saved ...` line still goes to stdout.
+
+`pin` uses the same fetch path but stores the object tree only in the repository, with no output copy. Pinned data is retained even when `cache_fetched = false` and is announced to peers like locally added content. `remove` is the way to unpin it.
 
 The daemon was automatically started by the CLI if it was not already running. It caches fetched content and advertises it to other peers by default.
 
@@ -135,6 +143,7 @@ meshvault status               Daemon and repository status (JSON)
 meshvault id                   Destination and identity hashes
 meshvault add <path> [--name]  Import a file or directory tree
 meshvault get <hash> [-o PATH] Fetch a file or directory tree
+meshvault pin <hash>           Fetch a file or tree into the repository and keep hosting it
 meshvault ls [hash] [--all]    List top-level objects, a directory, or all objects
 meshvault sources <hash>       Show known local and remote copies of an object
 meshvault remove <hash> [--recursive]  Remove an object or an unreferenced tree
@@ -192,13 +201,14 @@ Methods:
 | `id` | `{}` | `{destination, identity, name}` |
 | `add` | `{path, name?}` | `{object, path}` |
 | `get` / `fetch` | `{hash, output?}` | `{object, path, bytes, resumed, sources}` |
+| `pin` | `{hash}` | `{object, bytes}` |
 | `ls` / `list` | `{}`, `{all}`, or `{hash}` | top-level object array, flat object array, or `{root, name, entries}` |
 | `sources` | `{hash}` | `{root, copies, remote_copies, local, sources, unknown_peers}` |
 | `remove` | `{hash, recursive?}` | boolean |
 | `peers` | `{}` | peer array |
 | `announce` | `{}` | boolean |
 
-Long-running `get` requests emit `{"id":N,"progress":{stage,message,current,total}}` lines before the final response. Clients may ignore them; the response is always the last line for that id.
+Long-running `get` and `pin` requests emit `{"id":N,"progress":{stage,message,current,total}}` lines before the final response. Clients may ignore them; the response is always the last line for that id.
 
 Any local process with access to the socket can modify the repository, so the socket permissions matter. There is no network RPC listener.
 
@@ -221,11 +231,11 @@ fetch_parallelism = 4            # parallel source peers per file (1 disables)
 max_inventory_objects = 16384    # inventory entries accepted per peer
 max_inventory_objects_total = 65536  # inventory entries across all peers
 max_inbound_memory_bytes = 67108864  # 64 MiB global reassembly budget
-max_extract_entries = 100000     # recursive get entry budget
-max_extract_bytes = 10737418240  # recursive get byte budget (10 GiB)
+max_extract_entries = 100000     # recursive get/pin entry budget
+max_extract_bytes = 10737418240  # recursive get/pin byte budget (10 GiB)
 peer_service_bytes_per_sec = 4194304  # per-peer serving rate (4 MiB/s)
 peer_service_burst_bytes = 8388608    # per-peer burst allowance (8 MiB)
-cache_fetched = true             # keep and advertise fetched content
+cache_fetched = true             # keep and advertise content fetched by get
 transport_node = false           # forward traffic for other Reticulum nodes
 link_mtu_discovery = false       # keep interoperable 500-byte Reticulum MTU
 
@@ -263,7 +273,7 @@ All writes are staged in `tmp/`, `fsync`ed, and atomically renamed. A crash leav
 
 `ls` with no hash lists **top-level repository roots** — objects not referenced by any directory manifest — so an imported directory appears once rather than as all of its children. Use `ls <directory-hash>` to list a directory's entries or `ls --all` to see the flat inventory.
 
-`remove <hash>` removes one object only; removing a directory that way removes only its listing. `remove <hash> --recursive` removes the directory tree and its unreferenced children, while preserving any child still referenced by another directory manifest. There is currently no general garbage collector or pinning policy.
+`remove <hash>` removes one object only; removing a directory that way removes only its listing. `remove <hash> --recursive` removes the directory tree and its unreferenced children, while preserving any child still referenced by another directory manifest. There is currently no general garbage collector: content stays until it is explicitly removed, whether it was added locally, pinned, or cached by `get`.
 
 ## Security model
 
@@ -293,10 +303,10 @@ The end-to-end development check runs daemons over Reticulum TCP, adds files/dir
 - A fetch aborts after `fetch_stall_timeout_secs` without verified progress, and an RPC disconnect cancels its active operation.
 - Recursive directory extraction is bounded by `max_extract_entries` and `max_extract_bytes`, refuses symlink destinations, and does not follow pre-existing symlinks in extracted paths.
 - Each peer has a service token bucket (`peer_service_bytes_per_sec` / `peer_service_burst_bytes`) covering inventory pages, manifests, directories, and chunks. Requests are charged an estimated response cost with a 64 KiB minimum; an exhausted peer receives a `429` control error. Inventory pages are served from a cached snapshot rather than rebuilding the full inventory per page.
-- No pinning or garbage collection. Fetched files are cached indefinitely when `cache_fetched = true`.
+- No garbage collection. `pin` keeps fetched content until `remove`; `get` retains it in the repository only when `cache_fetched = true`.
 - No partial-directory progress sidecar; individual files resume, but already-completed files in a directory are re-exported/fail if the target exists.
 - Pieces are fetched in adaptive contiguous ranges, not individual pieces, which keeps protocol overhead low but can leave an under-filled tail when one source is much slower.
-- The RPC is Unix-only and does not stream progress updates. A disconnected CLI does not cancel an in-flight daemon download.
+- The RPC is Unix-only. A disconnected CLI cancels its in-flight daemon operation.
 - Directory names are not part of the directory hash (like IPFS links); the local display name is a sidecar.
 - No encryption at rest.
 

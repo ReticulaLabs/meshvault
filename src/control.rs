@@ -220,6 +220,12 @@ async fn dispatch(
             let result = node.get(root, output, cancel, Some(progress)).await?;
             Ok(serde_json::to_value(result)?)
         }
+        "pin" => {
+            let hash = param_string(&params, "hash")?;
+            let root = ContentHash::from_hex(&hash)?;
+            let result = node.pin(root, cancel, Some(progress)).await?;
+            Ok(serde_json::to_value(result)?)
+        }
         "ls" | "list" => {
             let hash = param_optional_string(&params, "hash")?;
             let all = match params.get("all") {
