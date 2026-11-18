@@ -336,6 +336,8 @@ If a repository grows to millions of objects, an optional SQLite index could be 
 
 `remove --recursive` computes the target subtree, computes objects reachable from all directory manifests outside that subtree, and deletes only target objects not in the external live set. Shared children therefore remain advertised and usable through their other parents.
 
+The default `ls` view is built the same way: objects referenced by any directory manifest are children, and only unreferenced objects are shown as repository roots. `ls <dirhash>` walks one directory level; `ls --all` exposes the flat object inventory.
+
 Startup behavior:
 
 - Corrupt manifests are ignored with a warning.
@@ -348,6 +350,7 @@ Startup behavior:
 - Unix domain socket, mode `0600`.
 - Newline-delimited JSON so it can be driven by shell tools.
 - One request/response per line; long operations hold their connection.
+- `get` streams advisory `{"id":N,"progress":{stage,message,current,total}}` lines before its final response, so the CLI can show live transfer and extraction status. Progress is best-effort and never replaces the final response.
 - The CLI auto-starts the daemon if the socket is not alive, waits for a ping, and then forwards the operation. This is why `meshvault get ...` works without a separate service-management step.
 - The daemon only exposes local operations. There is no remote RPC.
 

@@ -3,13 +3,16 @@
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use serde_json::{Value, json};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use meshvault::config::Config;
 use meshvault::control;
 use meshvault::hash::ContentHash;
 use meshvault::manifest::{DirEntry, ObjectKind, ObjectSummary};
-use meshvault::node::{DirListing, Node, PeerInfo, destination_name, load_identity};
+use meshvault::node::{
+    DirListing, Node, PeerInfo, SourceEntry, SourceInfo, destination_name, load_identity,
+};
 use reticulum_sdk::destination::SingleInputDestination;
 
 #[derive(Parser)]
@@ -87,8 +90,20 @@ enum Command {
         output: Option<PathBuf>,
     },
 
-    /// List local objects, or list a directory by hash.
-    Ls { hash: Option<String> },
+    /// List top-level objects, a directory by hash, or the flat inventory.
+    Ls {
+        /// Directory hash to list.
+        hash: Option<String>,
+        /// Show every stored object instead of only top-level roots.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Show known local and remote sources for an object hash.
+    Sources {
+        /// Object hash to look up.
+        hash: String,
+    },
 
     /// Remove an object from the local repository.
     Remove {
@@ -191,16 +206,55 @@ async fn main() -> Result<()> {
         }
         Command::Get { hash, output } => {
             let root = ContentHash::from_hex(&hash)?;
+            let interactive = std::io::stderr().is_terminal();
+            eprintln!("contacting meshvault daemon");
             let mut client = control::client_for(&paths).await?;
+            let mut last_stage = String::new();
+            let mut last_bucket = u64::MAX;
             let result = client
-                .call("get", json!({"hash": root, "output": output}))
+                .call_with_progress("get", json!({"hash": root, "output": output}), |event| {
+                    let stage = event
+                        .get("stage")
+                        .and_then(Value::as_str)
+                        .unwrap_or("working");
+                    let message = event.get("message").and_then(Value::as_str).unwrap_or("");
+                    let current = event.get("current").and_then(Value::as_u64);
+                    let total = event.get("total").and_then(Value::as_u64);
+                    let line = match (current, total) {
+                        (Some(current), Some(total)) if total > 0 => {
+                            format!("{stage}: {message} ({current}/{total})")
+                        }
+                        (Some(current), _) => format!("{stage}: {message} ({current})"),
+                        _ => format!("{stage}: {message}"),
+                    };
+                    if interactive {
+                        eprint!("\r\x1b[2K{line}");
+                        let _ = std::io::stderr().flush();
+                    } else {
+                        let bucket = current
+                            .zip(total)
+                            .and_then(|(current, total)| {
+                                current.checked_mul(10)?.checked_div(total)
+                            })
+                            .unwrap_or(0);
+                        if stage != last_stage || bucket != last_bucket {
+                            eprintln!("{line}");
+                            last_stage = stage.to_string();
+                            last_bucket = bucket;
+                        }
+                    }
+                })
                 .await?;
+            if interactive {
+                eprint!("\r\x1b[2K");
+                let _ = std::io::stderr().flush();
+            }
             let path = result.get("path").and_then(Value::as_str).unwrap_or("?");
             let bytes = result.get("bytes").and_then(Value::as_u64).unwrap_or(0);
             println!("saved {path} ({})", human_size(bytes));
             Ok(())
         }
-        Command::Ls { hash } => {
+        Command::Ls { hash, all } => {
             let mut client = control::client_for(&paths).await?;
             match hash {
                 Some(hash) => {
@@ -223,7 +277,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 None => {
-                    let value = client.call("ls", json!({})).await?;
+                    let value = client.call("ls", json!({"all": all})).await?;
                     let objects: Vec<ObjectSummary> = serde_json::from_value(value)?;
                     if objects.is_empty() {
                         println!("repository is empty");
@@ -233,6 +287,14 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Command::Sources { hash } => {
+            let root = ContentHash::from_hex(&hash)?;
+            let mut client = control::client_for(&paths).await?;
+            let value = client.call("sources", json!({"hash": root})).await?;
+            let info: SourceInfo = serde_json::from_value(value)?;
+            print_sources(&info);
             Ok(())
         }
         Command::Remove { hash, recursive } => {
@@ -358,6 +420,55 @@ fn print_object(object: &ObjectSummary) {
         println!("  ({} entries)", dir.entries);
     } else {
         println!();
+    }
+}
+
+fn print_sources(info: &SourceInfo) {
+    if info.copies == 0 {
+        println!("no known sources for {}", info.root);
+    } else {
+        println!(
+            "{} known {} for {} ({} local, {} remote)",
+            info.copies,
+            if info.copies == 1 { "copy" } else { "copies" },
+            info.root,
+            if info.local { 1 } else { 0 },
+            info.remote_copies
+        );
+        for source in &info.sources {
+            print_source(source);
+        }
+    }
+    if info.unknown_peers > 0 {
+        println!(
+            "{} linked peer(s) still syncing; the count may increase",
+            info.unknown_peers
+        );
+    }
+}
+
+fn print_source(source: &SourceEntry) {
+    let kind = kind_label(source.object.kind());
+    let size = human_size(source.object.size());
+    let name = meshvault::store::sanitize_name(&source.object.display_name())
+        .unwrap_or_else(|| source.object.root().short());
+    if source.local {
+        println!("  local   {kind:<10} {size:<9} {name}");
+    } else {
+        let address = source.address.as_deref().unwrap_or("?");
+        let node = source
+            .node_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("-");
+        let hops = source.hops.unwrap_or(0);
+        let snr = source
+            .snr
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "  remote  {kind:<10} {size:<9} {name}  from {node} ({address}, {hops} hops, SNR {snr})"
+        );
     }
 }
 

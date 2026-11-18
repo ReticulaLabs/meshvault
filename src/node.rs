@@ -62,6 +62,39 @@ impl CancelToken {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ProgressEvent {
+    pub stage: String,
+    pub message: String,
+    pub current: Option<u64>,
+    pub total: Option<u64>,
+}
+
+pub type ProgressSender = tokio::sync::mpsc::Sender<ProgressEvent>;
+
+#[derive(Clone, Copy)]
+struct TransferControl<'a> {
+    cancel: &'a CancelToken,
+    progress: Option<&'a ProgressSender>,
+}
+
+fn send_progress(
+    sender: Option<&ProgressSender>,
+    stage: &str,
+    message: impl Into<String>,
+    current: Option<u64>,
+    total: Option<u64>,
+) {
+    if let Some(sender) = sender {
+        let _ = sender.try_send(ProgressEvent {
+            stage: stage.to_string(),
+            message: message.into(),
+            current,
+            total,
+        });
+    }
+}
+
 struct ExtractionBudget {
     entries: usize,
     bytes: u64,
@@ -256,6 +289,32 @@ pub struct PeerInfo {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SourceInfo {
+    pub root: ContentHash,
+    /// Known holders: the local store plus linked peers advertising the object.
+    pub copies: usize,
+    pub remote_copies: usize,
+    pub local: bool,
+    pub sources: Vec<SourceEntry>,
+    /// Linked peers whose inventories have not been synchronized yet, so the
+    /// copy count is a lower bound.
+    pub unknown_peers: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SourceEntry {
+    pub local: bool,
+    /// Peer destination hash, absent for the local copy.
+    pub address: Option<String>,
+    /// Friendly node name from the peer's announce, if any.
+    pub node_name: Option<String>,
+    pub hops: Option<u8>,
+    pub snr: Option<f32>,
+    pub rssi: Option<i16>,
+    pub object: ObjectSummary,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub name: Option<String>,
     pub destination: String,
@@ -325,6 +384,8 @@ struct FetchCandidate {
 struct SharedFetch {
     manifest: Manifest,
     progress: Arc<StdMutex<PieceProgress>>,
+    progress_tx: Option<ProgressSender>,
+    label: String,
 }
 
 #[derive(Default)]
@@ -509,6 +570,10 @@ impl Node {
     // ─── Public repository operations ──────────────────────────────────────
 
     pub fn list_local(&self) -> Vec<ObjectSummary> {
+        self.store.root_inventory()
+    }
+
+    pub fn list_all(&self) -> Vec<ObjectSummary> {
         self.store.inventory()
     }
 
@@ -602,10 +667,18 @@ impl Node {
         root: ContentHash,
         output: Option<PathBuf>,
         cancel: CancelToken,
+        progress: Option<ProgressSender>,
     ) -> Result<GetResult> {
         if cancel.is_cancelled() {
             bail!("operation cancelled");
         }
+        send_progress(
+            progress.as_ref(),
+            "resolving",
+            "resolving object",
+            None,
+            None,
+        );
         let object = self
             .resolve_object(
                 root,
@@ -615,7 +688,18 @@ impl Node {
             .await?;
         match object {
             ObjectSummary::File(_) => {
-                let result = self.fetch_file(root, output, None, &cancel).await?;
+                send_progress(progress.as_ref(), "file", "fetching file", Some(0), None);
+                let result = self
+                    .fetch_file(
+                        root,
+                        output,
+                        None,
+                        TransferControl {
+                            cancel: &cancel,
+                            progress: progress.as_ref(),
+                        },
+                    )
+                    .await?;
                 Ok(GetResult {
                     object: result.object,
                     path: result.path,
@@ -661,9 +745,26 @@ impl Node {
                     self.config.max_extract_entries,
                     self.config.max_extract_bytes,
                 );
+                send_progress(
+                    progress.as_ref(),
+                    "directory",
+                    "extracting directory",
+                    Some(0),
+                    Some(summary.entries as u64),
+                );
                 let mut stack = Vec::new();
-                self.fetch_dir_recursive(root, &target, &mut stack, 0, &mut budget, &cancel)
-                    .await?;
+                self.fetch_dir_recursive(
+                    root,
+                    &target,
+                    &mut stack,
+                    0,
+                    &mut budget,
+                    TransferControl {
+                        cancel: &cancel,
+                        progress: progress.as_ref(),
+                    },
+                )
+                .await?;
                 Ok(GetResult {
                     object: ObjectSummary::Directory(summary.clone()),
                     path: target,
@@ -1941,8 +2042,10 @@ impl Node {
         root: ContentHash,
         output: Option<PathBuf>,
         mut budget: Option<&mut ExtractionBudget>,
-        cancel: &CancelToken,
+        control: TransferControl<'_>,
     ) -> Result<FetchResult> {
+        let cancel = control.cancel;
+        let progress_tx = control.progress;
         if cancel.is_cancelled() {
             bail!("operation cancelled");
         }
@@ -1954,6 +2057,7 @@ impl Node {
             if let Some(budget) = budget.as_deref_mut() {
                 budget.consume_bytes(size)?;
             }
+            send_progress(progress_tx, "saving", "copying local file", Some(0), None);
             let store = self.store.clone();
             let out = output.clone();
             let path = tokio::task::spawn_blocking(move || store.export(root, out.as_deref()))
@@ -2038,9 +2142,19 @@ impl Node {
                             let piece_progress =
                                 Arc::new(StdMutex::new(PieceProgress::new(verified)));
                             partial = Some(Arc::new(self.store.open_partial(root)?));
+                            let label = loaded.name.clone().unwrap_or_else(|| root.short());
+                            send_progress(
+                                progress_tx,
+                                "downloading",
+                                label.clone(),
+                                Some(initial_verified as u64),
+                                Some(loaded.piece_count() as u64),
+                            );
                             shared = Some(Arc::new(SharedFetch {
                                 manifest: loaded.clone(),
                                 progress: piece_progress.clone(),
+                                progress_tx: progress_tx.cloned(),
+                                label,
                             }));
                             progress = Some(piece_progress);
                             manifest = Some(loaded);
@@ -2231,6 +2345,13 @@ impl Node {
         drop(partial);
 
         let manifest = manifest.context("manifest missing")?;
+        send_progress(
+            progress_tx,
+            "saving",
+            manifest.name.clone().unwrap_or_else(|| root.short()),
+            Some(manifest.piece_count() as u64),
+            Some(manifest.piece_count() as u64),
+        );
         let store = self.store.clone();
         let manifest_for_finalize = manifest.clone();
         tokio::task::spawn_blocking(move || store.finalize_partial(&manifest_for_finalize))
@@ -2320,7 +2441,18 @@ impl Node {
                             chunk,
                         ) {
                             Ok(bytes) => {
-                                shared.progress.lock().unwrap().complete(start, count);
+                                let (done, total) = {
+                                    let mut progress = shared.progress.lock().unwrap();
+                                    progress.complete(start, count);
+                                    (progress.verified_count() as u64, progress.total() as u64)
+                                };
+                                send_progress(
+                                    shared.progress_tx.as_ref(),
+                                    "downloading",
+                                    shared.label.clone(),
+                                    Some(done),
+                                    Some(total),
+                                );
                                 stats.chunks += 1;
                                 stats.bytes += bytes as u64;
                                 break;
@@ -2447,8 +2579,10 @@ impl Node {
         stack: &mut Vec<ContentHash>,
         depth: usize,
         budget: &mut ExtractionBudget,
-        cancel: &CancelToken,
+        control: TransferControl<'_>,
     ) -> Result<()> {
+        let cancel = control.cancel;
+        let progress = control.progress;
         if cancel.is_cancelled() {
             bail!("operation cancelled");
         }
@@ -2463,11 +2597,19 @@ impl Node {
         fs::create_dir_all(target)
             .with_context(|| format!("create directory {}", target.display()))?;
 
-        for entry in manifest.entries {
+        let total_entries = manifest.entries.len() as u64;
+        for (index, entry) in manifest.entries.into_iter().enumerate() {
             if cancel.is_cancelled() {
                 bail!("operation cancelled");
             }
             budget.consume_entry()?;
+            send_progress(
+                progress,
+                "directory",
+                entry.name.clone(),
+                Some(index as u64 + 1),
+                Some(total_entries),
+            );
             let Some(name) = sanitize_name(&entry.name) else {
                 warn!("skipping unsafe directory entry name {:?}", entry.name);
                 continue;
@@ -2481,7 +2623,7 @@ impl Node {
             }
             match entry.kind {
                 ObjectKind::File => {
-                    self.fetch_file(entry.hash, Some(child), Some(budget), cancel)
+                    self.fetch_file(entry.hash, Some(child), Some(budget), control)
                         .await?;
                 }
                 ObjectKind::Directory => {
@@ -2491,7 +2633,7 @@ impl Node {
                         stack,
                         depth + 1,
                         budget,
-                        cancel,
+                        control,
                     ))
                     .await?;
                 }
@@ -2555,6 +2697,84 @@ impl Node {
                 .then_with(|| a.hops.cmp(&b.hops))
         });
         info
+    }
+
+    /// Report known holders of an object: the local store and every linked
+    /// peer whose synchronized inventory advertises the same root.
+    pub async fn sources(&self, root: ContentHash) -> SourceInfo {
+        let local = self.store.object_summary(root);
+        let local_present = local.is_some();
+        let local_digest = self.store.inventory_digest();
+        let peers = self.peers.lock().await;
+        let mut sources = Vec::new();
+
+        if let Some(object) = &local {
+            sources.push(SourceEntry {
+                local: true,
+                address: None,
+                node_name: None,
+                hops: None,
+                snr: None,
+                rssi: None,
+                object: object.clone(),
+            });
+        }
+
+        let mut unknown_peers = 0usize;
+        for peer in peers.values() {
+            if !peer.verified || peer.link.is_none() {
+                continue;
+            }
+
+            // A peer whose digest equals ours has exactly our inventory.  The
+            // sync path drops the redundant per-peer map in that case, so use
+            // the local summary as the source of truth.
+            let same_inventory = peer.inventory_digest == Some(local_digest);
+            let object = if peer.inventory_synced {
+                peer.object_summary(root).cloned()
+            } else if same_inventory {
+                local.clone()
+            } else {
+                None
+            };
+
+            match object {
+                Some(object) => sources.push(SourceEntry {
+                    local: false,
+                    address: Some(peer.address.to_hex_string()),
+                    node_name: peer.name.clone(),
+                    hops: Some(peer.hops),
+                    snr: peer.snr,
+                    rssi: peer.rssi,
+                    object,
+                }),
+                None if !peer.inventory_synced && !same_inventory => unknown_peers += 1,
+                None => {}
+            }
+        }
+
+        sources.sort_by(|a, b| {
+            b.local
+                .cmp(&a.local)
+                .then_with(|| a.hops.unwrap_or(u8::MAX).cmp(&b.hops.unwrap_or(u8::MAX)))
+                .then_with(|| {
+                    b.snr
+                        .unwrap_or(f32::MIN)
+                        .partial_cmp(&a.snr.unwrap_or(f32::MIN))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.address.cmp(&b.address))
+        });
+
+        let remote_copies = sources.iter().filter(|source| !source.local).count();
+        SourceInfo {
+            root,
+            copies: sources.len(),
+            remote_copies,
+            local: local_present,
+            sources,
+            unknown_peers,
+        }
     }
 }
 

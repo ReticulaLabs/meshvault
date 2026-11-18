@@ -51,6 +51,7 @@ pub struct Store {
     files: RwLock<HashMap<ContentHash, ManifestSummary>>,
     dirs: RwLock<HashMap<ContentHash, DirSummary>>,
     inventory_cache: RwLock<Option<Arc<Vec<ObjectSummary>>>>,
+    roots_cache: RwLock<Option<Arc<Vec<ObjectSummary>>>>,
     digest_cache: RwLock<Option<ContentHash>>,
 }
 
@@ -86,6 +87,7 @@ impl Store {
             files: RwLock::new(HashMap::new()),
             dirs: RwLock::new(HashMap::new()),
             inventory_cache: RwLock::new(None),
+            roots_cache: RwLock::new(None),
             digest_cache: RwLock::new(None),
         };
         store.rebuild_index()?;
@@ -234,6 +236,7 @@ impl Store {
 
     fn invalidate_inventory_cache(&self) {
         *self.inventory_cache.write().unwrap() = None;
+        *self.roots_cache.write().unwrap() = None;
         *self.digest_cache.write().unwrap() = None;
     }
 
@@ -330,6 +333,40 @@ impl Store {
 
     pub fn inventory(&self) -> Vec<ObjectSummary> {
         (*self.inventory_snapshot()).clone()
+    }
+
+    /// Top-level repository objects: inventory entries not referenced by any
+    /// directory manifest.  This is what `meshvault ls` shows by default.
+    pub fn root_inventory_snapshot(&self) -> Arc<Vec<ObjectSummary>> {
+        if let Some(snapshot) = self.roots_cache.read().unwrap().as_ref().cloned() {
+            return snapshot;
+        }
+        let mut cache = self.roots_cache.write().unwrap();
+        if let Some(snapshot) = cache.as_ref().cloned() {
+            return snapshot;
+        }
+        let all = self.inventory_snapshot();
+        let mut referenced = HashSet::new();
+        let dirs: Vec<ContentHash> = self.dirs.read().unwrap().keys().copied().collect();
+        for dir_root in dirs {
+            if let Ok(manifest) = self.read_dir_manifest(dir_root) {
+                for entry in manifest.entries {
+                    referenced.insert(entry.hash);
+                }
+            }
+        }
+        let roots: Vec<ObjectSummary> = all
+            .iter()
+            .filter(|object| !referenced.contains(&object.root()))
+            .cloned()
+            .collect();
+        let snapshot = Arc::new(roots);
+        *cache = Some(snapshot.clone());
+        snapshot
+    }
+
+    pub fn root_inventory(&self) -> Vec<ObjectSummary> {
+        (*self.root_inventory_snapshot()).clone()
     }
 
     pub fn file_count(&self) -> usize {
@@ -1029,6 +1066,28 @@ mod tests {
 
         assert!(store.export(manifest.root, Some(&link)).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"do not overwrite");
+    }
+
+    #[test]
+    fn root_inventory_hides_directory_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("tree");
+        fs::create_dir_all(input.join("nested")).unwrap();
+        write_temp_file(&input, "top.bin", 10);
+        write_temp_file(&input.join("nested"), "child.bin", 20);
+
+        let store = Store::open(&temp.path().join("repo")).unwrap();
+        let dir = store.import_dir(&input, 4096).unwrap();
+        let roots = store.root_inventory();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].root(), dir.root);
+        assert!(store.inventory().len() > roots.len());
+
+        let standalone = write_temp_file(temp.path(), "standalone.bin", 30);
+        let file = store.import_file(&standalone, 4096, None).unwrap();
+        let roots = store.root_inventory();
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().any(|object| object.root() == file.root));
     }
 
     #[test]

@@ -13,6 +13,7 @@ Files and directory trees are identified by BLAKE3 hashes. File data is transfer
 - **Recursive retrieval.** `get <directory-hash>` fetches the directory manifest and the whole tree.
 - **Bandwidth-aware transfer.** App-level selective-repeat with compact bitmap ACKs, adaptive send windows, and chunks that grow from one piece to a configured maximum based on measured throughput.
 - **Multi-source fetching.** A file is split into disjoint piece ranges and fetched from up to `fetch_parallelism` peers concurrently, with unified verification and resume.
+- **Source visibility.** `sources <hash>` reports the known local and remote copies of an object, including peer address, hop count, and signal quality.
 - **Minimal inventory traffic.** Peers exchange a 32-byte inventory digest; full inventories are only fetched when the digest changes.
 - **Crash-safe storage.** Raw blobs plus atomically written manifests. No database corruption surface; the index is rebuilt at startup.
 
@@ -65,6 +66,8 @@ docker exec meshvault meshvault get <hash> -o /var/lib/meshvault/import/out
 
 The RPC socket lives at `/var/lib/meshvault/control.sock`. The bundled build uses Reticulum's network-only features (TCP client/server); connect it to a Reticulum transport node that carries LoRa, serial, or other interfaces.
 
+The CLI talks to the running daemon. After upgrading MeshVault, restart the daemon (and replace any installed binary such as `/usr/local/bin/meshvault`) before expecting new behavior from commands.
+
 ## Quick start
 
 1. Create a configuration:
@@ -110,8 +113,13 @@ directory 8a7c50c3... (1841, photos)
   ...
 
 $ meshvault get 8a7c50c319772dad60d8ddbe8ccd1463a9519b9b4b2115d2b87cbf2bcc6044f1 -o ./received
+resolving: resolving object
+downloading: photos (120/1841)
+directory: raw (1/1841)
 saved ./received (2.4 GiB)
 ```
+
+`get` writes live progress to stderr while it resolves, downloads pieces, and extracts a directory tree. The final `saved ...` line still goes to stdout.
 
 The daemon was automatically started by the CLI if it was not already running. It caches fetched content and advertises it to other peers by default.
 
@@ -127,11 +135,14 @@ meshvault status               Daemon and repository status (JSON)
 meshvault id                   Destination and identity hashes
 meshvault add <path> [--name]  Import a file or directory tree
 meshvault get <hash> [-o PATH] Fetch a file or directory tree
-meshvault ls [hash]            List local objects, or a remote directory
+meshvault ls [hash] [--all]    List top-level objects, a directory, or all objects
+meshvault sources <hash>       Show known local and remote copies of an object
 meshvault remove <hash> [--recursive]  Remove an object or an unreferenced tree
 meshvault peers                Known/connected peers
 meshvault announce             Announce immediately
 ```
+
+`sources <hash>` counts the local store plus each linked peer advertising that exact root. For a directory hash, that means copies of the directory manifest, not necessarily every child object.
 
 `get` output rules:
 
@@ -181,10 +192,13 @@ Methods:
 | `id` | `{}` | `{destination, identity, name}` |
 | `add` | `{path, name?}` | `{object, path}` |
 | `get` / `fetch` | `{hash, output?}` | `{object, path, bytes, resumed, sources}` |
-| `ls` / `list` | `{}` or `{hash}` | local object array, or `{root, name, entries}` |
+| `ls` / `list` | `{}`, `{all}`, or `{hash}` | top-level object array, flat object array, or `{root, name, entries}` |
+| `sources` | `{hash}` | `{root, copies, remote_copies, local, sources, unknown_peers}` |
 | `remove` | `{hash, recursive?}` | boolean |
 | `peers` | `{}` | peer array |
 | `announce` | `{}` | boolean |
+
+Long-running `get` requests emit `{"id":N,"progress":{stage,message,current,total}}` lines before the final response. Clients may ignore them; the response is always the last line for that id.
 
 Any local process with access to the socket can modify the repository, so the socket permissions matter. There is no network RPC listener.
 
@@ -246,6 +260,8 @@ This build configures Reticulum **TCP client/server** interfaces. Point `connect
 ```
 
 All writes are staged in `tmp/`, `fsync`ed, and atomically renamed. A crash leaves either the old object or the new object, never a partial blob advertised as complete. Fetched files are verified piece-by-piece and then re-hashed in full against the root before being promoted.
+
+`ls` with no hash lists **top-level repository roots** — objects not referenced by any directory manifest — so an imported directory appears once rather than as all of its children. Use `ls <directory-hash>` to list a directory's entries or `ls --all` to see the flat inventory.
 
 `remove <hash>` removes one object only; removing a directory that way removes only its listing. `remove <hash> --recursive` removes the directory tree and its unreferenced children, while preserving any child still referenced by another directory manifest. There is currently no general garbage collector or pinning policy.
 

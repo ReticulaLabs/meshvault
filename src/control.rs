@@ -23,7 +23,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::Paths;
 use crate::hash::ContentHash;
-use crate::node::{CancelToken, Node};
+use crate::node::{CancelToken, Node, ProgressEvent, ProgressSender};
 
 #[derive(Deserialize)]
 struct RpcRequest {
@@ -118,16 +118,25 @@ async fn handle_connection(node: Arc<Node>, stream: UnixStream) -> Result<()> {
         };
         let id = request.id;
         let cancel = CancelToken::new();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
         let mut dispatch_fut = Box::pin(dispatch(
             &node,
             &request.method,
             request.params,
             cancel.clone(),
+            progress_tx,
         ));
         let mut monitoring = true;
         let result = loop {
             tokio::select! {
                 result = &mut dispatch_fut => break result,
+                Some(event) = progress_rx.recv() => {
+                    let message = json!({"id": id, "progress": event});
+                    let mut encoded = serde_json::to_vec(&message)?;
+                    encoded.push(b'\n');
+                    write_half.write_all(&encoded).await?;
+                    write_half.flush().await?;
+                }
                 next = lines.next_line(), if monitoring => {
                     match next {
                         Ok(Some(next_line)) => {
@@ -154,6 +163,15 @@ async fn handle_connection(node: Arc<Node>, stream: UnixStream) -> Result<()> {
             }
         };
 
+        // Deliver any progress that was queued just as the request finished.
+        while let Ok(event) = progress_rx.try_recv() {
+            let message = json!({"id": id, "progress": event});
+            let mut encoded = serde_json::to_vec(&message)?;
+            encoded.push(b'\n');
+            write_half.write_all(&encoded).await?;
+            write_half.flush().await?;
+        }
+
         let response = match result {
             Ok(result) => RpcResponse {
                 id,
@@ -179,6 +197,7 @@ async fn dispatch(
     method: &str,
     params: Value,
     cancel: CancelToken,
+    progress: ProgressSender,
 ) -> Result<Value> {
     match method {
         "ping" => Ok(json!("pong")),
@@ -198,19 +217,30 @@ async fn dispatch(
             let hash = param_string(&params, "hash")?;
             let root = ContentHash::from_hex(&hash)?;
             let output = param_optional_string(&params, "output")?.map(PathBuf::from);
-            let result = node.get(root, output, cancel).await?;
+            let result = node.get(root, output, cancel, Some(progress)).await?;
             Ok(serde_json::to_value(result)?)
         }
         "ls" | "list" => {
             let hash = param_optional_string(&params, "hash")?;
+            let all = match params.get("all") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => bail!("parameter \"all\" must be a boolean"),
+            };
             match hash {
                 Some(hash) => {
                     let root = ContentHash::from_hex(&hash)?;
                     let listing = node.list_directory(root, cancel).await?;
                     Ok(serde_json::to_value(listing)?)
                 }
+                None if all => Ok(serde_json::to_value(node.list_all())?),
                 None => Ok(serde_json::to_value(node.list_local())?),
             }
+        }
+        "sources" => {
+            let hash = param_string(&params, "hash")?;
+            let root = ContentHash::from_hex(&hash)?;
+            Ok(serde_json::to_value(node.sources(root).await)?)
         }
         "remove" => {
             let hash = param_string(&params, "hash")?;
@@ -256,6 +286,11 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
+    #[cfg(test)]
+    pub(crate) fn from_stream(stream: UnixStream) -> Self {
+        Self { stream, next_id: 1 }
+    }
+
     pub async fn connect(socket: &Path) -> Result<Self> {
         let stream = tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(socket))
             .await
@@ -265,6 +300,22 @@ impl RpcClient {
     }
 
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.call_with_progress(method, params, |_| {}).await
+    }
+
+    /// Send a request and invoke `on_progress` for every progress update the
+    /// daemon sends while the request is running.  Progress messages are
+    /// advisory: older daemons never send them, and any caller that does not
+    /// care can use [`RpcClient::call`] instead.
+    pub async fn call_with_progress<F>(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut on_progress: F,
+    ) -> Result<Value>
+    where
+        F: FnMut(&Value),
+    {
         let id = self.next_id;
         self.next_id += 1;
         let request = json!({"id": id, "method": method, "params": params});
@@ -274,20 +325,26 @@ impl RpcClient {
         self.stream.flush().await?;
 
         let mut reader = BufReader::new(&mut self.stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        if line.is_empty() {
-            bail!("daemon closed the RPC connection");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await?;
+            if line.is_empty() {
+                bail!("daemon closed the RPC connection");
+            }
+            let response: Value = serde_json::from_str(&line)?;
+            if let Some(event) = response.get("progress") {
+                on_progress(event);
+                continue;
+            }
+            let response_id = response.get("id").and_then(Value::as_u64).unwrap_or(0);
+            if response_id != id {
+                bail!("RPC response id mismatch");
+            }
+            if let Some(error) = response.get("error").and_then(Value::as_str) {
+                bail!("{error}");
+            }
+            return Ok(response.get("result").cloned().unwrap_or(Value::Null));
         }
-        let response: Value = serde_json::from_str(&line)?;
-        let response_id = response.get("id").and_then(Value::as_u64).unwrap_or(0);
-        if response_id != id {
-            bail!("RPC response id mismatch");
-        }
-        if let Some(error) = response.get("error").and_then(Value::as_str) {
-            bail!("{error}");
-        }
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 }
 
@@ -361,4 +418,67 @@ pub async fn client_for(paths: &Paths) -> Result<RpcClient> {
         "daemon did not start within 20s; see {}",
         log_path.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Accept one request, send two progress events, then the final result.
+    fn progress_server(mut stream: UnixStream) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (read_half, mut write_half) = stream.split();
+            let mut lines = BufReader::new(read_half).lines();
+            let line = lines.next_line().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let id = request["id"].as_u64().unwrap();
+            for (message, current) in [("first", 1), ("second", 2)] {
+                let event = json!({
+                    "id": id,
+                    "progress": {
+                        "stage": "downloading",
+                        "message": message,
+                        "current": current,
+                        "total": 2,
+                    },
+                });
+                write_half
+                    .write_all(format!("{event}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            write_half
+                .write_all(format!("{{\"id\":{id},\"result\":{{\"ok\":true}}}}\n").as_bytes())
+                .await
+                .unwrap();
+            write_half.flush().await.unwrap();
+        })
+    }
+
+    #[tokio::test]
+    async fn call_with_progress_delivers_events() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = progress_server(server_stream);
+        let mut client = RpcClient::from_stream(client_stream);
+        let mut seen = Vec::new();
+        let result = client
+            .call_with_progress("get", json!({}), |event| {
+                seen.push(event["message"].as_str().unwrap_or("").to_string());
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen, ["first", "second"]);
+        assert_eq!(result["ok"], true);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_ignores_progress_events() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = progress_server(server_stream);
+        let mut client = RpcClient::from_stream(client_stream);
+        let result = client.call("get", json!({})).await.unwrap();
+        assert_eq!(result["ok"], true);
+        server.await.unwrap();
+    }
 }
