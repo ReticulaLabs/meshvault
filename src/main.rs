@@ -9,9 +9,10 @@ use std::path::PathBuf;
 use meshvault::config::Config;
 use meshvault::control;
 use meshvault::hash::ContentHash;
-use meshvault::manifest::{DirEntry, ObjectKind, ObjectSummary};
+use meshvault::manifest::{ObjectKind, ObjectSummary};
 use meshvault::node::{
-    DirListing, Node, PeerInfo, PinResult, SourceEntry, SourceInfo, destination_name, load_identity,
+    DirListing, ListedEntry, MissingReport, Node, PeerInfo, PinResult, SourceEntry, SourceInfo,
+    destination_name, load_identity,
 };
 use reticulum_sdk::destination::SingleInputDestination;
 
@@ -91,7 +92,13 @@ enum Command {
     },
 
     /// Fetch an object or tree into the repository and keep hosting it.
-    Pin { hash: String },
+    Pin {
+        hash: String,
+        /// Check whether the object/tree is already present locally without
+        /// fetching anything.
+        #[arg(long)]
+        check: bool,
+    },
 
     /// List top-level objects, a directory by hash, or the flat inventory.
     Ls {
@@ -224,10 +231,23 @@ async fn main() -> Result<()> {
             println!("saved {path} ({})", human_size(bytes));
             Ok(())
         }
-        Command::Pin { hash } => {
+        Command::Pin { hash, check } => {
             let root = ContentHash::from_hex(&hash)?;
             eprintln!("contacting meshvault daemon");
             let mut client = control::client_for(&paths).await?;
+            if check {
+                let value = client
+                    .call("pin", json!({"hash": root, "check": true}))
+                    .await?;
+                let report: MissingReport = serde_json::from_value(value)?;
+                let color =
+                    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+                print_check_report(&report, color);
+                if !report.missing.is_empty() {
+                    bail!("{} object(s) missing locally", report.missing.len());
+                }
+                return Ok(());
+            }
             let mut ui = ProgressUi::new();
             let result = client
                 .call_with_progress("pin", json!({"hash": root}), |event| ui.report(event))
@@ -243,6 +263,8 @@ async fn main() -> Result<()> {
             match hash {
                 Some(hash) => {
                     let root = ContentHash::from_hex(&hash)?;
+                    let color =
+                        std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
                     let value = client.call("ls", json!({"hash": root})).await?;
                     let listing: DirListing = serde_json::from_value(value)?;
                     println!(
@@ -257,7 +279,18 @@ async fn main() -> Result<()> {
                     );
                     for entry in &listing.entries {
                         print!("  ");
-                        print_entry(entry);
+                        print_entry(entry, color);
+                    }
+                    let missing = listing
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.local == Some(false))
+                        .count();
+                    if missing > 0 {
+                        println!(
+                            "  {missing} of {} entries not present locally",
+                            listing.entries.len()
+                        );
                     }
                 }
                 None => {
@@ -510,14 +543,83 @@ fn print_source(source: &SourceEntry) {
     }
 }
 
-fn print_entry(entry: &DirEntry) {
+fn print_check_report(report: &MissingReport, color: bool) {
+    let name = report
+        .name
+        .as_deref()
+        .map(|name| format!(" ({name})"))
+        .unwrap_or_default();
+    if !report.local {
+        let status = match report.kind {
+            ObjectKind::File => "missing locally",
+            ObjectKind::Directory => "manifest missing locally",
+        };
+        let line = format!(
+            "{:<10} {}{}  {status}",
+            kind_label(report.kind),
+            report.root,
+            name
+        );
+        if color {
+            println!("\x1b[31m{line}\x1b[0m");
+        } else {
+            println!("{line}");
+        }
+        return;
+    }
+    if report.kind == ObjectKind::File {
+        let line = format!("{:<10} {}{}  present locally", "file", report.root, name);
+        if color {
+            println!("\x1b[32m{line}\x1b[0m");
+        } else {
+            println!("{line}");
+        }
+        return;
+    }
     println!(
-        "{:<10} {}  {:<9} {}",
-        kind_label(entry.kind),
-        entry.hash,
-        human_size(entry.size),
-        meshvault::store::sanitize_name(&entry.name).unwrap_or_else(|| entry.name.clone())
+        "directory {}{} ({} entries checked)",
+        report.root, name, report.checked
     );
+    if report.missing.is_empty() {
+        println!("  all entries present locally");
+        return;
+    }
+    println!(
+        "  {} of {} entries missing locally:",
+        report.missing.len(),
+        report.checked
+    );
+    for entry in &report.missing {
+        let line = format!(
+            "{:<10} {}  {:<9} {}",
+            kind_label(entry.kind),
+            entry.hash,
+            human_size(entry.size),
+            entry.path
+        );
+        if color {
+            println!("  \x1b[31m{line}\x1b[0m");
+        } else {
+            println!("  {line}  [missing]");
+        }
+    }
+}
+
+fn print_entry(entry: &ListedEntry, color: bool) {
+    let line = format!(
+        "{:<10} {}  {:<9} {}",
+        kind_label(entry.entry.kind),
+        entry.entry.hash,
+        human_size(entry.entry.size),
+        meshvault::store::sanitize_name(&entry.entry.name)
+            .unwrap_or_else(|| entry.entry.name.clone())
+    );
+    match entry.local {
+        Some(true) if color => println!("\x1b[32m{line}\x1b[0m"),
+        Some(false) if color => println!("\x1b[31m{line}\x1b[0m"),
+        Some(false) => println!("{line}  [missing]"),
+        _ => println!("{line}"),
+    }
 }
 
 fn kind_label(kind: ObjectKind) -> &'static str {

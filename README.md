@@ -129,6 +129,8 @@ pinned directory  8a7c50c3...  2.4 GiB  photos  (1841 entries)
 
 `pin` uses the same fetch path but stores the object tree only in the repository, with no output copy. Pinned data is retained even when `cache_fetched = false` and is announced to peers like locally added content. `remove` is the way to unpin it.
 
+`pin <hash> --check` is a dry run: it recursively verifies local presence, reports missing entries, and exits nonzero if anything still needs fetching.
+
 The daemon was automatically started by the CLI if it was not already running. It caches fetched content and advertises it to other peers by default.
 
 ## CLI
@@ -143,7 +145,7 @@ meshvault status               Daemon and repository status (JSON)
 meshvault id                   Destination and identity hashes
 meshvault add <path> [--name]  Import a file or directory tree
 meshvault get <hash> [-o PATH] Fetch a file or directory tree
-meshvault pin <hash>           Fetch a file or tree into the repository and keep hosting it
+meshvault pin <hash> [--check]  Fetch a file or tree and keep hosting it; --check only verifies local presence
 meshvault ls [hash] [--all]    List top-level objects, a directory, or all objects
 meshvault sources <hash>       Show known local and remote copies of an object
 meshvault remove <hash> [--recursive]  Remove an object or an unreferenced tree
@@ -203,6 +205,7 @@ Methods:
 | `get` / `fetch` | `{hash, output?}` | `{object, path, bytes, resumed, sources}` |
 | `pin` | `{hash}` | `{object, bytes}` |
 | `ls` / `list` | `{}`, `{all}`, or `{hash}` | top-level object array, flat object array, or `{root, name, entries}` |
+| `pin` | `{hash, check?}` | `{object, bytes}` or a missing-entry report when `check` is true |
 | `sources` | `{hash}` | `{root, copies, remote_copies, local, sources, unknown_peers}` |
 | `remove` | `{hash, recursive?}` | boolean |
 | `peers` | `{}` | peer array |
@@ -271,7 +274,9 @@ This build configures Reticulum **TCP client/server** interfaces. Point `connect
 
 All writes are staged in `tmp/`, `fsync`ed, and atomically renamed. A crash leaves either the old object or the new object, never a partial blob advertised as complete. Fetched files are verified piece-by-piece and then re-hashed in full against the root before being promoted.
 
-`ls` with no hash lists **top-level repository roots** — objects not referenced by any directory manifest — so an imported directory appears once rather than as all of its children. Use `ls <directory-hash>` to list a directory's entries or `ls --all` to see the flat inventory.
+`ls` with no hash lists **top-level repository roots** — objects not referenced by any directory manifest — so an imported directory appears once rather than as all of its children. Use `ls <directory-hash>` to list one level of a directory or `ls --all` to see the flat inventory.
+
+In `ls <directory-hash>`, each entry is shown in green when the referenced object is present locally and red when it is missing (`[missing]` is appended when colors are disabled or output is piped). For a directory, green means its manifest is present, not necessarily that every descendant is. Use `pin <directory-hash> --check` to recursively walk the local manifests and report every missing descendant without fetching anything from the network.
 
 `remove <hash>` removes one object only; removing a directory that way removes only its listing. `remove <hash> --recursive` removes the directory tree and its unreferenced children, while preserving any child still referenced by another directory manifest. There is currently no general garbage collector: content stays until it is explicitly removed, whether it was added locally, pinned, or cached by `get`.
 

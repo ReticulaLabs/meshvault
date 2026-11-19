@@ -395,10 +395,45 @@ pub struct PinResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListedEntry {
+    #[serde(flatten)]
+    pub entry: DirEntry,
+    /// Whether the referenced object itself exists in the local repository.
+    /// For a directory this means its manifest is present, not necessarily
+    /// that every descendant is.  `None` means the daemon did not report a
+    /// presence value (an older daemon).
+    pub local: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DirListing {
     pub root: ContentHash,
     pub name: Option<String>,
-    pub entries: Vec<DirEntry>,
+    pub entries: Vec<ListedEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MissingEntry {
+    /// Slash-separated path within the checked directory.
+    pub path: String,
+    pub hash: ContentHash,
+    pub kind: ObjectKind,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MissingReport {
+    pub root: ContentHash,
+    pub name: Option<String>,
+    pub kind: ObjectKind,
+    /// Whether the root object itself (file blob or directory manifest) is
+    /// present locally.
+    pub local: bool,
+    /// Number of manifest entries visited.
+    pub checked: usize,
+    /// Entries whose object is not present locally.  A missing directory
+    /// manifest is reported once; its children cannot be inspected.
+    pub missing: Vec<MissingEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -677,7 +712,7 @@ impl Node {
             return Ok(DirListing {
                 root,
                 name: summary.and_then(|s| s.name),
-                entries: manifest.entries,
+                entries: self.annotate_entries(manifest.entries),
             });
         }
         let object = self
@@ -696,8 +731,166 @@ impl Node {
         Ok(DirListing {
             root,
             name: summary.name,
-            entries: fetched.manifest.entries,
+            entries: self.annotate_entries(fetched.manifest.entries),
         })
+    }
+
+    fn annotate_entries(&self, entries: Vec<DirEntry>) -> Vec<ListedEntry> {
+        entries
+            .into_iter()
+            .map(|entry| {
+                let local = match entry.kind {
+                    ObjectKind::File => self.store.has_file(entry.hash),
+                    ObjectKind::Directory => self.store.has_dir(entry.hash),
+                };
+                ListedEntry {
+                    entry,
+                    local: Some(local),
+                }
+            })
+            .collect()
+    }
+
+    /// Check whether a file or directory tree is fully present in the local
+    /// repository.  This does not fetch object content; it only resolves the
+    /// root and walks local manifests.
+    pub async fn check_object(
+        self: &Arc<Self>,
+        root: ContentHash,
+        cancel: CancelToken,
+    ) -> Result<MissingReport> {
+        if cancel.is_cancelled() {
+            bail!("operation cancelled");
+        }
+        let object = self
+            .resolve_object(
+                root,
+                Duration::from_secs(self.config.fetch_wait_secs.max(5)),
+                &cancel,
+            )
+            .await?;
+        match object {
+            ObjectSummary::File(summary) => {
+                let local = self.store.has_file(root);
+                Ok(MissingReport {
+                    root,
+                    name: summary.name.clone(),
+                    kind: ObjectKind::File,
+                    local,
+                    checked: 1,
+                    missing: if local {
+                        Vec::new()
+                    } else {
+                        vec![MissingEntry {
+                            path: summary.name.unwrap_or_else(|| root.short()),
+                            hash: root,
+                            kind: ObjectKind::File,
+                            size: summary.size,
+                        }]
+                    },
+                })
+            }
+            ObjectSummary::Directory(summary) => {
+                let node = self.clone();
+                tokio::task::spawn_blocking(move || node.check_directory_report(summary, root))
+                    .await
+                    .context("directory check task panicked")?
+            }
+        }
+    }
+
+    fn check_directory_report(
+        &self,
+        summary: DirSummary,
+        root: ContentHash,
+    ) -> Result<MissingReport> {
+        let local = self.store.has_dir(root);
+        let mut report = MissingReport {
+            root,
+            name: summary.name.clone(),
+            kind: ObjectKind::Directory,
+            local,
+            checked: 0,
+            missing: Vec::new(),
+        };
+        if !local {
+            report.missing.push(MissingEntry {
+                path: summary.name.unwrap_or_else(|| root.short()),
+                hash: root,
+                kind: ObjectKind::Directory,
+                size: summary.total_size,
+            });
+            return Ok(report);
+        }
+        let mut budget = ExtractionBudget::new(self.config.max_extract_entries, u64::MAX);
+        let mut stack = Vec::new();
+        self.check_dir_entries(root, "", &mut report, &mut budget, 0, &mut stack)?;
+        Ok(report)
+    }
+
+    fn check_dir_entries(
+        &self,
+        root: ContentHash,
+        prefix: &str,
+        report: &mut MissingReport,
+        budget: &mut ExtractionBudget,
+        depth: usize,
+        stack: &mut Vec<ContentHash>,
+    ) -> Result<()> {
+        if depth > MAX_DIRECTORY_DEPTH {
+            bail!("directory nesting is too deep");
+        }
+        if stack.contains(&root) {
+            bail!("directory cycle detected at {}", root.short());
+        }
+        stack.push(root);
+        let manifest = self
+            .store
+            .read_dir_manifest(root)
+            .with_context(|| format!("read directory manifest {}", root.short()))?;
+        for entry in manifest.entries {
+            budget.consume_entry()?;
+            report.checked += 1;
+            let name = sanitize_name(&entry.name).unwrap_or_else(|| entry.hash.short());
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match entry.kind {
+                ObjectKind::File => {
+                    if !self.store.has_file(entry.hash) {
+                        report.missing.push(MissingEntry {
+                            path,
+                            hash: entry.hash,
+                            kind: entry.kind,
+                            size: entry.size,
+                        });
+                    }
+                }
+                ObjectKind::Directory => {
+                    if !self.store.has_dir(entry.hash) {
+                        report.missing.push(MissingEntry {
+                            path,
+                            hash: entry.hash,
+                            kind: entry.kind,
+                            size: entry.size,
+                        });
+                    } else {
+                        self.check_dir_entries(
+                            entry.hash,
+                            &path,
+                            report,
+                            budget,
+                            depth + 1,
+                            stack,
+                        )?;
+                    }
+                }
+            }
+        }
+        stack.pop();
+        Ok(())
     }
 
     /// Fetch a file or directory tree.  Directory hashes cause a recursive
@@ -3412,5 +3605,78 @@ mod tests {
         assert_eq!(ordered[1].manifest_hash, Some(preferred));
         assert_eq!(ordered[2].manifest_hash, Some(other));
         assert_eq!(ordered[3].manifest_hash, None);
+    }
+
+    #[tokio::test]
+    async fn directory_check_reports_missing_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let config = Config {
+            data_dir: Some(data_dir.clone()),
+            ..Config::default()
+        };
+        let paths = Paths {
+            config_file: temp.path().join("config.toml"),
+            data_dir: data_dir.clone(),
+            control_socket: data_dir.join("control.sock"),
+        };
+        let node = Node::start(config, paths).await.unwrap();
+
+        let source = temp.path().join("src");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("a.txt"), b"a").unwrap();
+        fs::write(source.join("sub/b.txt"), b"b").unwrap();
+        let added = node.add_path(source, None).await.unwrap();
+        let ObjectSummary::Directory(root_summary) = added.object else {
+            panic!("expected a directory");
+        };
+        let root = root_summary.root;
+        let root_manifest = node.store.read_dir_manifest(root).unwrap();
+        let sub = root_manifest
+            .entries
+            .iter()
+            .find(|entry| entry.name == "sub")
+            .unwrap();
+        let sub_hash = sub.hash;
+        let sub_manifest = node.store.read_dir_manifest(sub_hash).unwrap();
+        let child = sub_manifest
+            .entries
+            .iter()
+            .find(|entry| entry.name == "b.txt")
+            .unwrap();
+        let child_hash = child.hash;
+
+        let report = node.check_object(root, CancelToken::new()).await.unwrap();
+        assert!(report.local);
+        assert_eq!(report.kind, ObjectKind::Directory);
+        assert!(report.missing.is_empty());
+        assert_eq!(report.checked, 3);
+
+        let file_report = node
+            .check_object(child_hash, CancelToken::new())
+            .await
+            .unwrap();
+        assert!(file_report.local);
+        assert_eq!(file_report.kind, ObjectKind::File);
+        assert!(file_report.missing.is_empty());
+
+        node.remove(child_hash, false).await.unwrap();
+        let report = node.check_object(root, CancelToken::new()).await.unwrap();
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(report.missing[0].path, "sub/b.txt");
+        assert_eq!(report.missing[0].hash, child_hash);
+
+        let listing = node
+            .list_directory(sub_hash, CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].local, Some(false));
+
+        node.remove(sub_hash, false).await.unwrap();
+        let report = node.check_object(root, CancelToken::new()).await.unwrap();
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(report.missing[0].path, "sub");
+        assert_eq!(report.missing[0].kind, ObjectKind::Directory);
     }
 }

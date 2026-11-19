@@ -355,6 +355,7 @@ Startup behavior:
 - Newline-delimited JSON so it can be driven by shell tools.
 - One request/response per line; long operations hold their connection.
 - `get` and `pin` stream advisory `{"id":N,"progress":{stage,message,current,total}}` lines before their final response, so the CLI can show live transfer and extraction status. Progress is best-effort and never replaces the final response.
+- A directory listing marks each entry with local presence (`file` blob or directory manifest). `pin --check` walks the local manifests recursively and reports missing descendants without contacting peers or fetching content.
 - The CLI auto-starts the daemon if the socket is not alive, waits for a ping, and then forwards the operation. This is why `meshvault get ...` works without a separate service-management step.
 - The daemon only exposes local operations. There is no remote RPC.
 

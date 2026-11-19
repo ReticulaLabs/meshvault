@@ -223,8 +223,18 @@ async fn dispatch(
         "pin" => {
             let hash = param_string(&params, "hash")?;
             let root = ContentHash::from_hex(&hash)?;
-            let result = node.pin(root, cancel, Some(progress)).await?;
-            Ok(serde_json::to_value(result)?)
+            let check = match params.get("check") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => bail!("parameter \"check\" must be a boolean"),
+            };
+            if check {
+                let report = node.check_object(root, cancel).await?;
+                Ok(serde_json::to_value(report)?)
+            } else {
+                let result = node.pin(root, cancel, Some(progress)).await?;
+                Ok(serde_json::to_value(result)?)
+            }
         }
         "ls" | "list" => {
             let hash = param_optional_string(&params, "hash")?;
