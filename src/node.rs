@@ -76,6 +76,9 @@ pub type ProgressSender = tokio::sync::mpsc::Sender<ProgressEvent>;
 struct TransferControl<'a> {
     cancel: &'a CancelToken,
     progress: Option<&'a ProgressSender>,
+    /// Peer that served the parent directory manifest.  It is a useful
+    /// fallback source for children while the peer inventory catches up.
+    preferred_peer: Option<AddressHash>,
 }
 
 /// Where a fetched file should end up after it is stored.
@@ -404,7 +407,16 @@ struct FetchCandidate {
     link: LinkId,
     hops: u8,
     snr: Option<f32>,
-    manifest_hash: ContentHash,
+    /// `None` for a fallback source that was not (yet) found in the peer's
+    /// advertised inventory.
+    manifest_hash: Option<ContentHash>,
+}
+
+#[derive(Clone, Debug)]
+struct FetchedDirManifest {
+    manifest: DirManifest,
+    /// Peer that served a remote manifest, or `None` when it was local.
+    source: Option<AddressHash>,
 }
 
 struct SharedFetch {
@@ -436,7 +448,7 @@ pub struct Node {
     session_tasks: Mutex<HashMap<LinkId, tokio::task::JoinHandle<()>>>,
     connecting: Mutex<HashMap<AddressHash, Instant>>,
     link_peers: Mutex<HashMap<LinkId, AddressHash>>,
-    syncing: Mutex<HashSet<LinkId>>,
+    syncing: StdMutex<HashSet<LinkId>>,
     fetch_locks: Mutex<HashMap<ContentHash, Arc<Mutex<()>>>>,
     handshake_lock: Mutex<()>,
     announce_now: Notify,
@@ -510,7 +522,7 @@ impl Node {
             session_tasks: Mutex::new(HashMap::new()),
             connecting: Mutex::new(HashMap::new()),
             link_peers: Mutex::new(HashMap::new()),
-            syncing: Mutex::new(HashSet::new()),
+            syncing: StdMutex::new(HashSet::new()),
             fetch_locks: Mutex::new(HashMap::new()),
             handshake_lock: Mutex::new(()),
             announce_now: Notify::new(),
@@ -678,13 +690,13 @@ impl Node {
         let ObjectSummary::Directory(summary) = object else {
             bail!("{} is a file, not a directory", root.short());
         };
-        let manifest = self
-            .get_dir_manifest(root, Some(&summary), &cancel, false)
+        let fetched = self
+            .get_dir_manifest(root, Some(&summary), &cancel, false, None)
             .await?;
         Ok(DirListing {
             root,
             name: summary.name,
-            entries: manifest.entries,
+            entries: fetched.manifest.entries,
         })
     }
 
@@ -725,6 +737,7 @@ impl Node {
                         TransferControl {
                             cancel: &cancel,
                             progress: progress.as_ref(),
+                            preferred_peer: None,
                         },
                     )
                     .await?;
@@ -790,6 +803,7 @@ impl Node {
                     TransferControl {
                         cancel: &cancel,
                         progress: progress.as_ref(),
+                        preferred_peer: None,
                     },
                 )
                 .await?;
@@ -840,6 +854,7 @@ impl Node {
                         TransferControl {
                             cancel: &cancel,
                             progress: progress.as_ref(),
+                            preferred_peer: None,
                         },
                     )
                     .await?;
@@ -849,10 +864,12 @@ impl Node {
                 }
             }
             ObjectSummary::Directory(summary) => {
-                let mut budget = ExtractionBudget::new(
-                    self.config.max_extract_entries,
-                    self.config.max_extract_bytes,
-                );
+                // Pin is an explicit request to keep the whole tree.  The
+                // entry and depth limits still bound traversal, but the
+                // extraction byte cap (a guard against `get` writing an
+                // unexpectedly large tree to disk) must not prevent pinning a
+                // dataset larger than `max_extract_bytes`.
+                let mut budget = ExtractionBudget::new(self.config.max_extract_entries, u64::MAX);
                 send_progress(
                     progress.as_ref(),
                     "directory",
@@ -870,6 +887,7 @@ impl Node {
                     TransferControl {
                         cancel: &cancel,
                         progress: progress.as_ref(),
+                        preferred_peer: None,
                     },
                 )
                 .await?;
@@ -1022,7 +1040,7 @@ impl Node {
             return;
         };
         if !synced {
-            self.spawn_inventory_sync(link_id).await;
+            self.spawn_inventory_sync(link_id);
         }
     }
 
@@ -1036,13 +1054,13 @@ impl Node {
                 .collect()
         };
         for link in links {
-            self.spawn_inventory_sync(link).await;
+            self.spawn_inventory_sync(link);
         }
     }
 
-    async fn spawn_inventory_sync(self: &Arc<Self>, link_id: LinkId) {
+    fn spawn_inventory_sync(self: &Arc<Self>, link_id: LinkId) {
         {
-            let mut syncing = self.syncing.lock().await;
+            let mut syncing = self.syncing.lock().unwrap();
             if !syncing.insert(link_id) {
                 debug!("inventory sync already running on link {link_id}");
                 return;
@@ -1052,10 +1070,16 @@ impl Node {
         let node = self.clone();
         tokio::spawn(async move {
             let result = node.sync_inventory(link_id).await;
-            if let Err(err) = result {
+            if let Err(err) = &result {
                 debug!("inventory sync with {link_id} failed: {err:#}");
             }
-            node.syncing.lock().await.remove(&link_id);
+            node.syncing.lock().unwrap().remove(&link_id);
+            if result.is_ok() {
+                // An inventory change may have arrived while the sync was
+                // running; its own request was coalesced.  Catch up now that
+                // this sync has released the slot.
+                node.trigger_inventory_syncs().await;
+            }
         });
     }
 
@@ -1166,11 +1190,33 @@ impl Node {
         }
         if let Some(peer) = peers.get_mut(&peer_address) {
             peer.inventory = objects;
-            peer.inventory_synced = true;
-            if let Some(snapshot) = snapshot {
-                peer.inventory_digest = Some(snapshot);
+            match snapshot {
+                Some(snapshot)
+                    if peer
+                        .inventory_digest
+                        .is_some_and(|digest| digest != snapshot) =>
+                {
+                    // A newer inventory announcement arrived while pages were
+                    // being read.  Keep the consistent snapshot we have, but
+                    // leave the peer unsynced so the follow-up sync catches up
+                    // instead of losing the update.
+                    debug!(
+                        "inventory changed during sync with {}; scheduling follow-up",
+                        peer_address.to_hex_string()
+                    );
+                    peer.inventory_synced = false;
+                }
+                Some(snapshot) => {
+                    peer.inventory_digest = Some(snapshot);
+                    peer.inventory_synced = true;
+                }
+                None => {
+                    peer.inventory_synced = true;
+                }
             }
-            peer.objects = peer.inventory.len() as u32;
+            if peer.inventory_synced {
+                peer.objects = peer.inventory.len() as u32;
+            }
         }
         debug!(
             "synced inventory from peer {}",
@@ -1219,7 +1265,7 @@ impl Node {
             }
             return;
         }
-        self.spawn_inventory_sync(session.link_id).await;
+        self.spawn_inventory_sync(session.link_id);
     }
 
     // ─── Link lifecycle and handshake ──────────────────────────────────────
@@ -2051,7 +2097,7 @@ impl Node {
                     link: peer.link?,
                     hops: peer.hops,
                     snr: peer.snr,
-                    manifest_hash: summary.manifest_hash(),
+                    manifest_hash: Some(summary.manifest_hash()),
                 })
             })
             .collect();
@@ -2064,6 +2110,25 @@ impl Node {
             })
         });
         candidates
+    }
+
+    /// Build a candidate for a peer we already know is linked and verified,
+    /// even if its advertised inventory does not list the object.  Directory
+    /// manifests are authenticated, so a child hash learned from one is safe
+    /// to request from the peer that served the parent.
+    async fn linked_peer_candidate(&self, address: AddressHash) -> Option<FetchCandidate> {
+        let peers = self.peers.lock().await;
+        let peer = peers.get(&address)?;
+        if !peer.verified {
+            return None;
+        }
+        Some(FetchCandidate {
+            peer: address,
+            link: peer.link?,
+            hops: peer.hops,
+            snr: peer.snr,
+            manifest_hash: None,
+        })
     }
 
     async fn session_for_link(&self, link_id: LinkId) -> Option<Arc<LinkSession>> {
@@ -2080,7 +2145,9 @@ impl Node {
         }
         let mut counts: HashMap<ContentHash, usize> = HashMap::new();
         for candidate in &candidates {
-            *counts.entry(candidate.manifest_hash).or_default() += 1;
+            if let Some(hash) = candidate.manifest_hash {
+                *counts.entry(hash).or_default() += 1;
+            }
         }
         let preferred = counts
             .into_iter()
@@ -2088,9 +2155,21 @@ impl Node {
             .map(|(hash, _)| hash);
         let mut ordered = candidates;
         if let Some(preferred) = preferred {
-            ordered.sort_by_key(|candidate| candidate.manifest_hash != preferred);
+            ordered.sort_by_key(|candidate| match candidate.manifest_hash {
+                Some(hash) => hash != preferred,
+                None => true,
+            });
         }
         ordered
+    }
+
+    fn candidate_matches_manifest(
+        candidate: &FetchCandidate,
+        manifest_hash: ContentHash,
+        manifest_source: Option<AddressHash>,
+    ) -> bool {
+        candidate.manifest_hash == Some(manifest_hash)
+            || (candidate.manifest_hash.is_none() && manifest_source == Some(candidate.peer))
     }
 
     async fn fetch_lock(&self, root: ContentHash) -> Arc<Mutex<()>> {
@@ -2205,10 +2284,22 @@ impl Node {
 
         let discovery_deadline =
             Instant::now() + Duration::from_secs(self.config.fetch_wait_secs.max(5));
+        // A child named by an authenticated directory manifest is expected to
+        // exist.  Allow extra time for a transient link/session recovery on
+        // the peer that served the parent before giving up on it.
+        let preferred_deadline = Instant::now()
+            + Duration::from_secs(
+                self.config
+                    .fetch_wait_secs
+                    .max(5)
+                    .saturating_mul(6)
+                    .max(120),
+            );
         let mut last_error: Option<anyhow::Error> = None;
         let mut cooldown: HashMap<AddressHash, Instant> = HashMap::new();
         let mut manifest: Option<Manifest> = None;
         let mut manifest_hash: Option<ContentHash> = None;
+        let mut manifest_source: Option<AddressHash> = None;
         let mut progress: Option<Arc<StdMutex<PieceProgress>>> = None;
         let mut shared: Option<Arc<SharedFetch>> = None;
         let mut partial: Option<Arc<std::fs::File>> = None;
@@ -2237,9 +2328,30 @@ impl Node {
                     bail!("fetch made no progress for {:?}", stall_timeout);
                 }
             }
-            let candidates = self.fetch_candidates(root, ObjectKind::File).await;
+            let mut candidates = self.fetch_candidates(root, ObjectKind::File).await;
             if candidates.is_empty() {
                 self.trigger_inventory_syncs().await;
+            }
+            if let Some(preferred) = control.preferred_peer
+                && !candidates
+                    .iter()
+                    .any(|candidate| candidate.peer == preferred)
+                && let Some(candidate) = self.linked_peer_candidate(preferred).await
+            {
+                // The directory manifest named this file, so the peer that
+                // served the parent is a valid source even when the peer
+                // inventory has not listed the child yet.
+                debug!(
+                    "adding {} as fallback source for {} (not in advertised inventory)",
+                    preferred.to_hex_string(),
+                    root.short()
+                );
+                candidates.push(candidate);
+            }
+            if candidates.is_empty() && control.preferred_peer.is_some() {
+                // The parent source is currently unreachable (link recovery).
+                // Do not let an earlier transient error shorten the wait.
+                last_error = None;
             }
 
             if manifest.is_none() {
@@ -2286,6 +2398,7 @@ impl Node {
                             progress = Some(piece_progress);
                             manifest = Some(loaded);
                             manifest_hash = Some(hash);
+                            manifest_source = Some(candidate.peer);
                             if !budget_charged {
                                 if let Some(budget) = budget.as_deref_mut() {
                                     budget
@@ -2313,7 +2426,12 @@ impl Node {
                     }
                 }
                 if manifest.is_none() {
-                    if Instant::now() >= discovery_deadline {
+                    let deadline = if control.preferred_peer.is_some() && last_error.is_none() {
+                        preferred_deadline
+                    } else {
+                        discovery_deadline
+                    };
+                    if Instant::now() >= deadline {
                         return Err(last_error.unwrap_or_else(|| {
                             anyhow!("no peer advertises file {}", root.short())
                         }));
@@ -2343,7 +2461,9 @@ impl Node {
 
             let matching: Vec<FetchCandidate> = candidates
                 .into_iter()
-                .filter(|candidate| candidate.manifest_hash == manifest_hash)
+                .filter(|candidate| {
+                    Self::candidate_matches_manifest(candidate, manifest_hash, manifest_source)
+                })
                 .collect();
             let now = Instant::now();
             let mut usable: Vec<FetchCandidate> = matching
@@ -2633,12 +2753,16 @@ impl Node {
         summary: Option<&DirSummary>,
         cancel: &CancelToken,
         force_cache: bool,
-    ) -> Result<DirManifest> {
+        preferred_peer: Option<AddressHash>,
+    ) -> Result<FetchedDirManifest> {
         if cancel.is_cancelled() {
             bail!("operation cancelled");
         }
         if let Ok(manifest) = self.store.read_dir_manifest(root) {
-            return Ok(manifest);
+            return Ok(FetchedDirManifest {
+                manifest,
+                source: None,
+            });
         }
         let summary = match summary {
             Some(summary) => summary.clone(),
@@ -2654,7 +2778,22 @@ impl Node {
                 ObjectSummary::File(_) => bail!("{} is a file, not a directory", root.short()),
             },
         };
-        let candidates = self.fetch_candidates(root, ObjectKind::Directory).await;
+        let mut candidates = self.fetch_candidates(root, ObjectKind::Directory).await;
+        if let Some(preferred) = preferred_peer
+            && !candidates
+                .iter()
+                .any(|candidate| candidate.peer == preferred)
+            && let Some(candidate) = self.linked_peer_candidate(preferred).await
+        {
+            // The peer that served the parent manifest can usually serve this
+            // child too, even if its inventory has not caught up yet.
+            debug!(
+                "using {} as fallback source for directory {} (not in advertised inventory)",
+                preferred.to_hex_string(),
+                root.short()
+            );
+            candidates.push(candidate);
+        }
         let mut last_error: Option<anyhow::Error> = None;
         for candidate in candidates {
             if cancel.is_cancelled() {
@@ -2688,7 +2827,10 @@ impl Node {
                         .context("store directory task panicked")??;
                         self.notify_inventory_changed();
                     }
-                    return Ok(manifest);
+                    return Ok(FetchedDirManifest {
+                        manifest,
+                        source: Some(peer_address),
+                    });
                 }
                 Ok(Control::Error { code, message }) => {
                     last_error = Some(anyhow!("peer error {code}: {message}"));
@@ -2729,9 +2871,14 @@ impl Node {
         }
         stack.push(root);
         let force_cache = matches!(output, DirectoryOutput::Store);
-        let manifest = self
-            .get_dir_manifest(root, None, cancel, force_cache)
+        let fetched = self
+            .get_dir_manifest(root, None, cancel, force_cache, control.preferred_peer)
             .await?;
+        let manifest = fetched.manifest;
+        let control = TransferControl {
+            preferred_peer: fetched.source.or(control.preferred_peer),
+            ..control
+        };
         if let DirectoryOutput::Extract(target) = output {
             fs::create_dir_all(target)
                 .with_context(|| format!("create directory {}", target.display()))?;
@@ -3208,5 +3355,62 @@ mod tests {
         drop(first);
         let second = DataDirLock::acquire(temp.path()).unwrap();
         drop(second);
+    }
+
+    fn candidate(peer: &[u8], manifest_hash: Option<ContentHash>) -> FetchCandidate {
+        FetchCandidate {
+            peer: AddressHash::new_from_slice(peer),
+            link: AddressHash::new_from_slice(peer),
+            hops: 1,
+            snr: None,
+            manifest_hash,
+        }
+    }
+
+    #[test]
+    fn wildcard_candidate_only_matches_its_manifest_source() {
+        let hash = ContentHash([7; 32]);
+        let other_hash = ContentHash([8; 32]);
+        let fallback = candidate(b"fallback", None);
+        let known = candidate(b"known", Some(hash));
+        let wrong_layout = candidate(b"wrong", Some(other_hash));
+
+        assert!(Node::candidate_matches_manifest(
+            &fallback,
+            hash,
+            Some(fallback.peer)
+        ));
+        assert!(!Node::candidate_matches_manifest(
+            &fallback,
+            hash,
+            Some(known.peer)
+        ));
+        assert!(Node::candidate_matches_manifest(
+            &known,
+            hash,
+            Some(fallback.peer)
+        ));
+        assert!(!Node::candidate_matches_manifest(
+            &wrong_layout,
+            hash,
+            Some(wrong_layout.peer)
+        ));
+    }
+
+    #[test]
+    fn ordering_prefers_the_most_common_manifest_layout() {
+        let preferred = ContentHash([1; 32]);
+        let other = ContentHash([2; 32]);
+        let candidates = vec![
+            candidate(b"a", Some(preferred)),
+            candidate(b"b", Some(other)),
+            candidate(b"c", Some(preferred)),
+            candidate(b"d", None),
+        ];
+        let ordered = Node::order_candidates_for_manifest(candidates);
+        assert_eq!(ordered[0].manifest_hash, Some(preferred));
+        assert_eq!(ordered[1].manifest_hash, Some(preferred));
+        assert_eq!(ordered[2].manifest_hash, Some(other));
+        assert_eq!(ordered[3].manifest_hash, None);
     }
 }

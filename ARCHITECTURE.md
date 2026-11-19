@@ -316,14 +316,16 @@ Workers never overlap piece ranges, and verification-before-write prevents a cor
 ### Directory
 
 1. Fetch the directory manifest and verify its BLAKE3 directory hash.
-2. Create a per-get/pin budget (`max_extract_entries`, `max_extract_bytes`).
+2. Create a per-get extraction budget (`max_extract_entries`, `max_extract_bytes`).  Pin uses the same entry and depth limits but not the byte cap, because the caller explicitly asked to retain the whole tree.
 3. Consume one entry per listed child and the actual manifest size of every file before transfer.
 4. Materialize entries in sorted order (`pin` skips filesystem materialization).
 5. Files use the file fetch flow.
 6. Child directories recurse, with a depth limit and a stack-based cycle check.
 7. Unsafe entry names are rejected/skipped; symlink output paths and pre-existing/symlink child paths are refused; output never escapes the target directory.
 
-`pin` shares both flows with two differences: fetched files are never exported, and fetched manifests/files are retained regardless of `cache_fetched`. Recursive pinning still enforces the same budgets, depth limit, and cycle check.
+`pin` shares both flows with two differences: fetched files are never exported, and fetched manifests/files are retained regardless of `cache_fetched`. Recursive pinning still enforces the entry, depth, and cycle limits, but not the `get` extraction byte cap.
+
+Children named by a freshly fetched directory manifest are also requested from the peer that served the parent when the peer's advertised inventory has not listed them yet. The manifest and all chunks remain hash-verified, so this only improves reachability; it does not weaken validation.
 
 ## Storage design
 

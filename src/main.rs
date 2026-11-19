@@ -216,8 +216,9 @@ async fn main() -> Result<()> {
                 .call_with_progress("get", json!({"hash": root, "output": output}), |event| {
                     ui.report(event)
                 })
-                .await?;
+                .await;
             ui.finish();
+            let result = result?;
             let path = result.get("path").and_then(Value::as_str).unwrap_or("?");
             let bytes = result.get("bytes").and_then(Value::as_u64).unwrap_or(0);
             println!("saved {path} ({})", human_size(bytes));
@@ -230,9 +231,9 @@ async fn main() -> Result<()> {
             let mut ui = ProgressUi::new();
             let result = client
                 .call_with_progress("pin", json!({"hash": root}), |event| ui.report(event))
-                .await?;
+                .await;
             ui.finish();
-            let result: PinResult = serde_json::from_value(result)?;
+            let result: PinResult = serde_json::from_value(result?)?;
             print!("pinned ");
             print_object(&result.object);
             Ok(())

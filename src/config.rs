@@ -48,7 +48,7 @@ pub struct Config {
     pub max_inventory_objects_total: usize,
     /// Maximum directory entries visited by one recursive get or pin.
     pub max_extract_entries: usize,
-    /// Maximum file bytes visited by one recursive get or pin.
+    /// Maximum file bytes materialized by one recursive get.
     pub max_extract_bytes: u64,
     /// Process-wide budget for inbound reassembly buffers.
     pub max_inbound_memory_bytes: u64,
